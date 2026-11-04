@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable
 
 import torch
 
 from .datasource import ArraylakeERA5Source
+from .regions import Region, output_selection
 
 # NOTE: earth2studio is deliberately NOT imported at module level. The AIFS
 # backends run in envs that contain anemoi and no earth2studio at all, and
@@ -38,6 +40,21 @@ class ModelBackend:
     name: str
     load_default_package: Callable
     load_model: Callable
+    # Which output fields to keep (Earth2Studio channel ids, e.g. "t2m") and
+    # which box to crop to. None keeps everything / the whole globe. Applied
+    # through Earth2Studio's own `output_coords`, i.e. at write time, so a
+    # France-only t2m run stores ~0.4% of one field per step instead of
+    # every field globally -- the difference between GB and TB per season.
+    variables: list[str] | None = None
+    region: Region | None = None
+
+    def output_coords(self, model) -> OrderedDict:
+        """Earth2Studio output selection for this backend's variables/region,
+        built from the loaded model's own coordinates."""
+        if not self.variables and self.region is None:
+            return OrderedDict()
+        model_coords = model.output_coords(model.input_coords())
+        return OrderedDict(output_selection(model_coords, self.variables, self.region))
 
     def load(self, device: str | None = None):
         device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -59,11 +76,17 @@ class ModelBackend:
         from earth2studio.run import deterministic as run_deterministic
 
         model = self.load(device)
+        # Validate the selection BEFORE fetching data / running: a typo in a
+        # variable name should cost seconds, not a full rollout.
+        selection = self.output_coords(model)
         io = ZarrBackend(out_zarr)
         logger.info(
-            "Running %s: init_time=%s, n_steps=%d -> %s", self.name, init_time, n_steps, out_zarr
+            "Running %s: init_time=%s, n_steps=%d, variables=%s, region=%s -> %s",
+            self.name, init_time, n_steps, self.variables or "ALL",
+            self.region or "global", out_zarr,
         )
-        run_deterministic([init_time], n_steps, model, data_source, io)
+        run_deterministic([init_time], n_steps, model, data_source, io,
+                          output_coords=selection)
         logger.info("%s run complete. Forecast written to %s", self.name, out_zarr)
         return out_zarr
 
@@ -113,6 +136,7 @@ class StochasticModelBackend(ModelBackend):
             return super().run(data_source, init_time, n_steps, out_zarr, device)
 
         model = self.load(device)
+        selection = self.output_coords(model)
         tmp_dir = Path(out_zarr).parent / f".{Path(out_zarr).name}.members"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         member_paths = []
@@ -121,7 +145,7 @@ class StochasticModelBackend(ModelBackend):
                 logger.info("%s: member %d/%d", self.name, i + 1, self.n_members)
                 path = tmp_dir / f"member_{i:03d}.zarr"
                 run_deterministic([init_time], n_steps, model, data_source,
-                                  ZarrBackend(str(path)))
+                                  ZarrBackend(str(path)), output_coords=selection)
                 member_paths.append(path)
 
             logger.info("Combining %d members into %s", len(member_paths), out_zarr)
@@ -232,10 +256,11 @@ def get_backend(name: str, n_members: int | None = None,
     carrying no extra information.
 
     `variables` / `region` select which fields are kept and which box is
-    cropped at write time. They are implemented for the anemoi (AIFS)
-    backends only; asking for them on an Earth2Studio backend is an error
-    rather than being silently ignored, because the caller would then get
-    a global, all-variable zarr while believing it was regional."""
+    cropped at write time, for every backend: the anemoi (AIFS) backends
+    apply them while regridding, the Earth2Studio ones through
+    `output_coords`. A backend lacking either attribute is an error rather
+    than a silent no-op, because the caller would then get a global,
+    all-variable zarr while believing it was regional."""
     name = name.lower()
     if name not in BACKEND_FACTORIES:
         raise ValueError(f"Unknown model '{name}'. Choose from {list(BACKEND_FACTORIES)}")
@@ -253,9 +278,8 @@ def get_backend(name: str, n_members: int | None = None,
     if variables or region:
         if not (hasattr(backend, "variables") and hasattr(backend, "region")):
             raise ValueError(
-                f"Model '{name}' does not support --variables/--region yet "
-                "(implemented for the anemoi AIFS backends only). Run it "
-                "without them and crop afterwards."
+                f"Model '{name}' does not support --variables/--region. Run "
+                "it without them and crop afterwards."
             )
         from .regions import parse_region
         backend = dataclasses.replace(

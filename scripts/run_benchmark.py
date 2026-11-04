@@ -35,6 +35,7 @@ import pandas as pd
 import xarray as xr
 
 from weather_pipeline.datasource import build_data_source
+from weather_pipeline.ensemble_checks import DegenerateEnsembleError, check_member_spread
 from weather_pipeline import wbx_scoring as wbx
 
 logger = logging.getLogger(__name__)
@@ -167,7 +168,9 @@ def _manifest_path(out_zarr: str) -> Path:
 
 
 def existing_forecast_matches(model: str, init_time: str, n_steps: int, out_zarr: str,
-                              n_members: int | None = None, source: str = "era5") -> bool:
+                              n_members: int | None = None, source: str = "era5",
+                              store_variables: list[str] | None = None,
+                              store_region: str | None = None) -> bool:
     """True if a usable forecast for exactly this request is already on disk.
 
     Checks the manifest rather than mere existence of the zarr: a store left
@@ -184,8 +187,11 @@ def existing_forecast_matches(model: str, init_time: str, n_steps: int, out_zarr
         logger.warning("Unreadable manifest at %s; re-running", manifest)
         return False
 
+    # store_variables / store_region are part of the identity: a France-only
+    # t2m store must never be reused for a global or multi-variable request.
     want = {"model": model, "init_time": init_time, "n_steps": n_steps,
-            "n_members": n_members, "source": source}
+            "n_members": n_members, "source": source,
+            "store_variables": store_variables, "store_region": store_region}
     got = {k: meta.get(k) for k in want}
     if got != want:
         logger.info("Existing forecast at %s is for %s, want %s; re-running",
@@ -195,7 +201,9 @@ def existing_forecast_matches(model: str, init_time: str, n_steps: int, out_zarr
 
 
 def write_manifest(model: str, init_time: str, n_steps: int, out_zarr: str,
-                   n_members: int | None = None, source: str = "era5") -> None:
+                   n_members: int | None = None, source: str = "era5",
+                   store_variables: list[str] | None = None,
+                   store_region: str | None = None) -> None:
     """Written only AFTER the run succeeds, so a crashed run leaves no
     manifest and is never mistaken for a complete forecast."""
     _manifest_path(out_zarr).write_text(json.dumps({
@@ -204,12 +212,16 @@ def write_manifest(model: str, init_time: str, n_steps: int, out_zarr: str,
         "n_steps": n_steps,
         "n_members": n_members,
         "source": source,
+        "store_variables": store_variables,
+        "store_region": store_region,
         "written_utc": pd.Timestamp.now("UTC").isoformat(),
     }, indent=2))
 
 
 def run_model_isolated(model: str, init_time: str, n_steps: int, out_zarr: str,
-                       n_members: int | None = None, source: str = "era5") -> None:
+                       n_members: int | None = None, source: str = "era5",
+                       store_variables: list[str] | None = None,
+                       store_region: str | None = None) -> None:
     """Runs one model's forecast to completion in its own uv environment.
 
     Each call is a fresh `uv run` invocation: uv resolves & (on first run)
@@ -241,6 +253,10 @@ def run_model_isolated(model: str, init_time: str, n_steps: int, out_zarr: str,
     if n_members is not None:
         cmd += ["--n-members", str(n_members)]
     cmd += ["--source", source]
+    if store_variables:
+        cmd += ["--variables", *store_variables]
+    if store_region:
+        cmd += ["--region", store_region]
     # Clear any existing store first. Earth2Studio's ZarrBackend OPENS an
     # existing zarr rather than replacing it, so a store left by a previous
     # run with a different number of steps keeps its old lead_time axis and
@@ -268,7 +284,16 @@ def run_model_isolated(model: str, init_time: str, n_steps: int, out_zarr: str,
         # imports fine but is much slower.
         env["FORCE_CUDA_EXTENSION"] = "1"
     subprocess.run(cmd, cwd=REPO_ROOT, check=True, env=env)
-    write_manifest(model, init_time, n_steps, out_zarr, n_members, source)
+
+    # An ensemble whose members are copies would score as a deterministic
+    # forecast while labelled as an ensemble. Check before the manifest is
+    # written, so a degenerate run is never treated as complete or reused.
+    if n_members is not None and n_members > 1:
+        spread = check_member_spread(str(store))
+        logger.info("%s: max member spread at first lead = %.3f", model, spread)
+
+    write_manifest(model, init_time, n_steps, out_zarr, n_members, source,
+                   store_variables, store_region)
 
 
 def score_case(
@@ -474,6 +499,19 @@ def main() -> None:
     parser.add_argument("--list-metrics", action="store_true",
                         help="Print available metrics and exit.")
     parser.add_argument(
+        "--store-variables", nargs="+", default=None, metavar="VAR",
+        help="Write only these fields to the forecast zarr (e.g. t2m). "
+             "Default: every field the model produces. Independent of "
+             "--variables, which selects what is SCORED.",
+    )
+    parser.add_argument(
+        "--store-region", default=None,
+        help="Crop the forecast zarr at write time: a name from "
+             "weather_pipeline.regions.REGIONS (e.g. france) or "
+             "'lat_min,lat_max,lon_min,lon_max'. Default: global. A full "
+             "season of global ensembles is TBs; a France t2m crop is GBs.",
+    )
+    parser.add_argument(
         "--force", action="store_true",
         help="Re-run models even when a matching forecast already exists.",
     )
@@ -500,12 +538,18 @@ def main() -> None:
             try:
                 members = args.n_members if model in STOCHASTIC_MODELS else None
                 if not args.force and existing_forecast_matches(
-                    model, init_time, steps, out_zarr, members, args.source
+                    model, init_time, steps, out_zarr, members, args.source,
+                    args.store_variables, args.store_region,
                 ):
                     logger.info("Reusing existing forecast for %s (use --force to re-run)", label)
                 else:
                     run_model_isolated(model, init_time, steps, out_zarr,
-                                       members, args.source)
+                                       members, args.source,
+                                       args.store_variables, args.store_region)
+            except DegenerateEnsembleError:
+                logger.exception("%s returned identical members -- not scored", label)
+                failed.append(f"{label} (degenerate ensemble)")
+                continue
             except subprocess.CalledProcessError:
                 logger.exception("%s failed inside its own env -- skipping its scoring", label)
                 failed.append(label)

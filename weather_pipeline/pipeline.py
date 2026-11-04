@@ -75,13 +75,12 @@ def main() -> None:
     parser.add_argument(
         "--variables", nargs="+", default=None, metavar="VAR",
         help="Keep only these output fields, as ERA5 channel ids (e.g. t2m "
-             "u10m). Default: every field the checkpoint produces. AIFS only.",
+             "u10m). Default: every field the checkpoint produces.",
     )
     parser.add_argument(
         "--region", default=None,
         help="Crop to a named region (e.g. france) or 'lat_min,lat_max,"
-             "lon_min,lon_max' with lon in -180..180. Default: global. "
-             "AIFS only.",
+             "lon_min,lon_max' with lon in -180..180. Default: global.",
     )
     parser.add_argument(
         "--skip-existing", action="store_true",
