@@ -30,9 +30,9 @@ uv run scripts/run_benchmark.py --models aifs-ens1.0 --n-members 10 --source era
 For long runs, store only what you score. `--store-variables` and `--store-region` crop the forecast zarr at write time for every model (a France-only t2m ensemble is a few MB per run instead of GBs):
 
 ```
-uv run scripts/run_benchmark.py --models aifs-ens1.0 aurora1.5-ens --n-members 10 \
+uv run scripts/run_benchmark.py --models aifs-ens1.0 aurora1.5-ens-6h --n-members 10 \
     --init-times 2026-06-01T00:00:00 --n-steps 20 --variables t2m \
-    --store-variables t2m --store-region france --region europe
+    --store-variables t2m --store-region france
 ```
 
 Ensemble runs whose members come out identical are rejected before they are recorded as complete (`weather_pipeline/ensemble_checks.py`).

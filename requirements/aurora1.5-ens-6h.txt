@@ -1,0 +1,7 @@
+# Aurora 1.5 ENSEMBLE at 6-hourly output (Aurora1p5Ensemble_6h): same
+# checkpoint and dependencies as aurora1.5-ens.txt. earth2studio 0.20 is the
+# first release this pipeline has confirmed ships the _6h classes; an
+# "ImportError: cannot import name 'Aurora1p5Ensemble_6h'" means an older
+# earth2studio was resolved.
+torch==2.13.0+cu126
+earth2studio[aurora]>=0.20
