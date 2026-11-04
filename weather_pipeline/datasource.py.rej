@@ -1,0 +1,96 @@
+diff a/weather_pipeline/datasource.py b/weather_pipeline/datasource.py	(rejected hunks)
+@@ -77,7 +77,9 @@ SURFACE_ALIASES: dict[str, list[str]] = {
+     # SURFACE geopotential from the single-level group -- deliberately a
+     # different id from pressure-level "z500" etc, which PRESSURE_ALIASES
+     # handles, so the two can't be confused.
+-    "z_surface": ["z", "geopotential"],
++    # ARCO-ERA5 keeps both kinds in ONE dataset: "geopotential" there is the
++    # 4-D pressure-level field, so its surface name must be tried first.
++    "z_surface": ["z", "geopotential_at_surface", "geopotential"],
+     "sdor": ["sdor", "standard_deviation_of_orography"],
+     "slor": ["slor", "slope_of_sub_gridscale_orography"],
+     # --- added for Aurora 1.5, whose input set is far wider than Aurora 1's
+@@ -328,6 +330,72 @@ class ArraylakeERA5Source:
+         return out.transpose("time", "variable", "lat", "lon")
+
+
++ARCO_ERA5_URL = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
++
++
++class ARCOERA5Source(ArraylakeERA5Source):
++    """ERA5 from Google's public ARCO-ERA5 store, the same DataSource as
++    ArraylakeERA5Source (it only changes where the datasets come from).
++
++    Why: the Arraylake ERA5 repo stops at the last FINAL ERA5 month, while
++    ARCO-ERA5 continues with ERA5T, ECMWF's preliminary release a few days
++    behind real time, which ECMWF later replaces with final ERA5 (usually
++    with negligible changes). One store therefore covers 1940 to a few days
++    ago -- a whole recent season, initial conditions and truth alike.
++
++    Layout: one chunk per hour per variable (global), surface and pressure
++    levels in ONE dataset, dims time/latitude/longitude/level, CF long names
++    (all covered by SURFACE_ALIASES / PRESSURE_ALIASES).
++
++    Past the end of ERA5T the store's time axis keeps going with empty
++    (NaN) chunks, so requests beyond `last_time` are refused here rather
++    than handing NaNs to a model or scorer.
++    """
++
++    def __init__(self, ds: xr.Dataset | None = None):
++        if ds is None:
++            ds = open_arco_era5()
++        attrs = ds.attrs
++        stop = attrs.get("valid_time_stop_era5t") or attrs.get("valid_time_stop")
++        if stop is None:
++            raise ValueError("ARCO-ERA5 store has no valid_time_stop attribute; "
++                             "cannot tell where its data ends")
++        # the attributes give a date: the whole day is covered
++        self.last_time = pd.Timestamp(stop) + pd.Timedelta(hours=23)
++        self.last_final = pd.Timestamp(attrs.get("valid_time_stop", stop)) + pd.Timedelta(hours=23)
++        super().__init__(ds, ds)
++        logger.info("ARCO-ERA5: final ERA5 to %s, ERA5T to %s",
++                    self.last_final.date(), self.last_time.date())
++
++    def _fetch_sic(self, target_time) -> xr.DataArray:
++        """Sea ice straight from the already-open store. The parent class
++        goes through sea_ice.py, which opens ARCO-ERA5 a second time and
++        re-parses its metadata (minutes on a slow link) for a field that is
++        right here."""
++        return self.single["sea_ice_cover"].sel(time=[pd.Timestamp(target_time)])
++
++    def __call__(self, time, variable) -> xr.DataArray:
++        times = pd.to_datetime(np.atleast_1d(time).tolist())
++        late = [t for t in times if t > self.last_time]
++        if late:
++            raise KeyError(
++                f"ARCO-ERA5 ends at {self.last_time} (ERA5T); asked for {late[0]}"
++                + (f" and {len(late) - 1} later time(s)" if len(late) > 1 else ""))
++        if any(t > self.last_final for t in times):
++            logger.info("ARCO-ERA5: using preliminary ERA5T for times after %s",
++                        self.last_final.date())
++        return super().__call__(time, variable)
++
++
++def open_arco_era5() -> xr.Dataset:
++    """Lazy, anonymous open of the public store. Only the consolidated
++    metadata and the 1-D coordinates are read here; each field is one chunk
++    fetched when selected."""
++    logger.info("Opening ARCO-ERA5 (%s)...", ARCO_ERA5_URL)
++    return xr.open_zarr(ARCO_ERA5_URL, chunks=None, consolidated=True,
++                        storage_options={"token": "anon"})
++
++
+ def build_data_source(source: str = "era5"):
+     """ERA5 for historical dates, IFS for recent ones.
+
+@@ -346,5 +414,9 @@ def build_data_source(source: str = "era5"):
+     if source == "ifs":
+         from .ifs_datasource import ArraylakeIFSSource
+         return ArraylakeIFSSource()
++    if source == "arco":
++        return ARCOERA5Source()
++    if source != "era5":
++        raise ValueError(f"Unknown data source '{source}' (era5, arco, ifs)")
+     single, pl = open_era5_repo()
+     return ArraylakeERA5Source(single, pl)
+\ No newline at end of file

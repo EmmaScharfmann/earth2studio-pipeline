@@ -35,7 +35,8 @@ dependencies = [
     "cfgrib",
     "eccodes>=2.38",
     "eccodeslib",
-    "pyyaml",   
+    "pyyaml",
+    "gcsfs",
     "scipy",    
     "dask",
     "huggingface_hub"
