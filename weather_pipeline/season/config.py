@@ -36,8 +36,8 @@ ENSEMBLE_MODELS = {"aifs-ens1.0", "aurora1.5-ens-6h", "atlas-crps"}
 TRUTHS: dict[str, tuple[str | None, str | None]] = {
     # Arraylake ERA5: from 1940, lags real time by a few months
     "era5": ("1940-01-01", None),
-    # step-0 HRES fields from ECMWF open data on AWS (the paper's
-    # "HRES-fc0"); the bucket starts in 2024
+    # step-0 HRES fields from ECMWF open data (Google Cloud / AWS mirrors; the paper's
+    # "HRES-fc0"), from 2024
     "ifs_fc0": ("2024-01-01", None),
 }
 
