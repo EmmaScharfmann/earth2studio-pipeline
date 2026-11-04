@@ -14,8 +14,10 @@ from __future__ import annotations
 
 def build_truth(name: str, **kwargs):
     if name == "era5":
-        from ..datasource import build_data_source
-        return build_data_source("era5")
+        # ARCO-ERA5 rather than the Arraylake repo: the same ERA5 up to the
+        # last final month, then ERA5T, so a recent season is fully covered.
+        from ..datasource import ARCOERA5Source
+        return ARCOERA5Source()
     if name == "ifs_fc0":
         from ..ifs_opendata import IFSOpenDataFC0Source
         return IFSOpenDataFC0Source(**kwargs)
