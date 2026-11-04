@@ -85,3 +85,44 @@ def to_signed_lon(lon):
     """0..360 -> -180..180. Use before interpolating across the meridian."""
     lon = np.asarray(lon, dtype="f8")
     return ((lon + 180.0) % 360.0) - 180.0
+
+def output_selection(model_coords, variables=None, region: Region | None = None):
+    """Earth2Studio `output_coords` that keep only `variables` inside `region`.
+
+    `model_coords` is the model's own output coordinate system
+    (``model.output_coords(model.input_coords())``). The selection is built
+    from those exact coordinate values, because Earth2Studio's `map_coords`
+    matches lat/lon by equality: values taken from the model itself always
+    match, values computed independently might not.
+
+    Returns a plain dict (the caller wraps it in an OrderedDict); an empty
+    dict means "write everything", which is Earth2Studio's own default.
+
+    Non-monotonic longitudes for regions crossing 0 deg (see module
+    docstring) are fine here: `map_coords` falls back to an index select that
+    keeps the requested order.
+    """
+    selection: dict = {}
+
+    if variables:
+        have = [str(v) for v in np.asarray(model_coords["variable"])]
+        missing = [v for v in variables if v not in have]
+        if missing:
+            raise ValueError(
+                f"Model does not output {missing}. It outputs: {have}"
+            )
+        selection["variable"] = np.asarray(list(variables))
+
+    if region is not None:
+        lat = np.asarray(model_coords["lat"])
+        lon = np.asarray(model_coords["lon"])
+        if lat.ndim != 1 or lon.ndim != 1:
+            raise ValueError(
+                "Region cropping needs a regular 1-D lat/lon grid; this model "
+                f"outputs lat{lat.shape} / lon{lon.shape}."
+            )
+        lat_idx, lon_idx = crop_indices(region, lat, lon)
+        selection["lat"] = lat[lat_idx]
+        selection["lon"] = lon[lon_idx]
+
+    return selection
