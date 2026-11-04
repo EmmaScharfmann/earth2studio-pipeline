@@ -4,7 +4,7 @@ additive per-case statistics.
 
 For each (truth, model, init) the scorer loads the forecast in the standard
 layout (forecast.open_forecast), takes the truth at the same valid times on
-the same grid, and stores `scores.case_statistics` as one small netCDF:
+the same grid, and stores `metrics.case_statistics` as one small netCDF:
 
     <season dir>/scores/<truth>/<model>_<YYYYmmddTHHMM>.nc
 
@@ -21,7 +21,7 @@ paper's mask, from ECMWF open data, so no Arraylake login is needed for it).
 
 A case is rescored when its forecast changed (the manifest's written_utc
 is stored with the statistics), when its file predates the current
-scores.STATS_VERSION, or with force=True.
+metrics.STATS_VERSION, or with force=True.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ import xarray as xr
 from .. import forecast_runner
 from ..forecast_runner import init_slug
 from ..regions import crop_indices, parse_region
-from . import scores
+from . import metrics
 from .config import SeasonConfig
 from .forecast import open_forecast
 from .schedule import Job, build_jobs, is_done, season_dir
@@ -209,7 +209,7 @@ def score_case(cfg: SeasonConfig, job: Job, truth: TruthCache,
     obs = _on_grid(obs, fc, truth.truth)
     w = _on_grid(weights, fc, "land weights")
     seed = zlib.crc32(f"{job.model}|{init.isoformat()}|{truth.truth}".encode())
-    stats = scores.case_statistics(fc, obs, w, thresholds=None, seed=seed)
+    stats = metrics.case_statistics(fc, obs, w, thresholds=None, seed=seed)
     stats = stats.expand_dims(init_time=[np.datetime64(init, "ns")])
     stats.attrs.update(model=job.model, truth=truth.truth, init_time=job.init_time,
                        forecast_written_utc=_manifest_time(job) or "",
@@ -237,7 +237,7 @@ def run_scoring(cfg: SeasonConfig, models: list[str] | None = None,
             path = stats_path(cfg, truth_name, job)
             if not force and path.exists():
                 with xr.open_dataset(path) as old:
-                    current = old.attrs.get("stats_version", 1) == scores.STATS_VERSION
+                    current = old.attrs.get("stats_version", 1) == metrics.STATS_VERSION
                     if current and old.attrs.get("forecast_written_utc") == (_manifest_time(job) or ""):
                         summary["up_to_date"] += 1
                         continue
@@ -264,7 +264,7 @@ def run_scoring(cfg: SeasonConfig, models: list[str] | None = None,
 def load_statistics(cfg: SeasonConfig, truth: str,
                     models: list[str] | None = None) -> dict[str, xr.Dataset]:
     """{model: Dataset with an init_time dim} of every scored case. Sum over
-    init_time (or any subset of it), then scores.finalise."""
+    init_time (or any subset of it), then metrics.finalise."""
     out = {}
     for spec in cfg.models:
         if models and spec.name not in models:
@@ -282,7 +282,7 @@ def load_statistics(cfg: SeasonConfig, truth: str,
 def season_scores(stats: xr.Dataset, init_times=None) -> xr.Dataset:
     """Finalised metrics over the given init times (default: all)."""
     total = summed(stats, init_times)
-    return scores.finalise(total)
+    return metrics.finalise(total)
 
 
 def summed(stats: xr.Dataset, init_times=None) -> xr.Dataset:
@@ -297,4 +297,4 @@ def summed(stats: xr.Dataset, init_times=None) -> xr.Dataset:
 
 def season_maps(stats: xr.Dataset, init_times=None) -> xr.Dataset:
     """Per-cell metrics by forecast day over the given init times."""
-    return scores.finalise_maps(summed(stats, init_times))
+    return metrics.finalise_maps(summed(stats, init_times))

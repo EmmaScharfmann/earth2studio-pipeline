@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from weather_pipeline.season import scores as S
+from weather_pipeline.season import metrics as S
 
 sr = pytest.importorskip("scoringrules")
 rng = np.random.default_rng(42)

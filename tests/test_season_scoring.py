@@ -9,7 +9,7 @@ import pytest
 import xarray as xr
 
 from weather_pipeline import forecast_runner
-from weather_pipeline.season import score as SC
+from weather_pipeline.season import scoring as SC
 from weather_pipeline.season import forecast as F
 from weather_pipeline.season.schedule import build_jobs
 
@@ -138,7 +138,7 @@ def test_bias_maps_and_elevation_bands(season):
     h = SC.elevation(cfg, source=FakeTruth())
     assert float(h.min()) >= 0 and float(h.max()) > 1500
     bands = SC.elevation_bands(h)
-    banded = SC.scores.by_band(SC.summed(st), bands, w)
+    banded = SC.metrics.by_band(SC.summed(st), bands, w)
     # land-only bands, in elevation order; the fake sea strip spans 500-1000 m
     assert list(banded["band"].values) == ["200-500 m", "1000-1500 m", ">1500 m"]
     assert np.isfinite(banded["crps"]).all() and (banded["cells"] > 0).all()
