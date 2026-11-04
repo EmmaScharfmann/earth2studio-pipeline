@@ -41,7 +41,17 @@ Ensemble runs whose members come out identical are rejected before they are reco
 
 ## Seasonal evaluation (in progress)
 
-`weather_pipeline/season/` evaluates AI ensembles over a season, following the probabilistic protocol of Wessel et al. (arXiv:2610.20519). The period is an input (`configs/summer2026_france.yaml`; `period: {season: JJA, year: 2026}` or explicit dates). Truths are ERA5 and the step-0 HRES field from ECMWF open data (`weather_pipeline/ifs_opendata.py`, 2024 onward); `season/scores.py` holds the fair, additive scores.
+`weather_pipeline/season/` evaluates AI ensembles over a season, following the probabilistic protocol of Wessel et al. (arXiv:2610.20519). The period is an input (`configs/summer2026_france.yaml`: `period: {season: JJA, year: 2026}` or explicit dates). Truths are ERA5 and the step-0 HRES field from ECMWF open data (`weather_pipeline/ifs_opendata.py`, 2024 onward); `season/scores.py` holds the fair, additive scores.
+
+```bash
+uv run scripts/run_season.py configs/summer2026_france.yaml --stage status
+uv run scripts/run_season.py configs/summer2026_france.yaml --stage forecast --limit 2   # a first test
+uv run scripts/run_season.py configs/summer2026_france.yaml --stage forecast             # the rest; rerun to resume
+```
+
+Forecasts go to `outputs/season/<name>/forecasts/`, one store per (model, initialisation), separate from `run_benchmark.py`'s `outputs/forecasts/`. `--start/--end` or `--season/--year` run another period without editing the config; `--models` restricts to some models; `--dry-run` lists the jobs. Failed jobs are logged to `forecast_failures.json` and retried on the next run.
+
+Each job is a separate `uv run`, so the checkpoint is loaded once per initialisation (about 35 s for AIFS-ENS, on top of the forecast itself).
 
 ## Contents
 

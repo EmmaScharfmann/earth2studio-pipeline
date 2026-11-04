@@ -17,7 +17,7 @@ February 2026, i.e. the winter that ENDS in the named year.
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
