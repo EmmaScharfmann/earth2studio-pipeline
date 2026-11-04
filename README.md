@@ -51,6 +51,15 @@ uv run scripts/run_season.py configs/summer2026_france.yaml --stage forecast    
 
 Forecasts go to `outputs/season/<name>/forecasts/`, one store per (model, initialisation), separate from `run_benchmark.py`'s `outputs/forecasts/`. `--start/--end` or `--season/--year` run another period without editing the config; `--models` restricts to some models; `--dry-run` lists the jobs. Failed jobs are logged to `forecast_failures.json` and retried on the next run.
 
+Score finished forecasts and open the report (CPU; safe to run while forecasts are still being produced, and only new or changed forecasts are scored):
+
+```bash
+uv run scripts/run_season.py configs/summer2026_france.yaml --stage score
+# then open notebooks/season_report.ipynb
+```
+
+Scores are saved per case as additive statistics in `outputs/season/<name>/scores/<truth>/`; truth fields are cached per valid time in `outputs/season/<name>/truth/`.
+
 On a Slurm node with several GPUs, run one process per GPU, each with a cost-balanced share of the jobs (`--shard i --num-shards n`):
 
 ```bash
