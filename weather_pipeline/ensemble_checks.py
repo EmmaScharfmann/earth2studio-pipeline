@@ -27,11 +27,16 @@ class DegenerateEnsembleError(RuntimeError):
     """An ensemble whose members are (numerically) identical."""
 
 
-def first_lead_spread(ds: xr.Dataset, variable: str | None = None) -> float:
-    """Largest across-member standard deviation at the first FORECAST lead.
+def first_lead_spread(ds: xr.Dataset, variable: str | None = None,
+                      min_lead_hours: float = 6) -> float:
+    """Largest across-member standard deviation at the first lead of at least
+    `min_lead_hours`.
 
     Lead zero is skipped: it is the shared initial condition, so its spread
-    is zero by construction for every ensemble here.
+    is zero by construction for every ensemble here. The default of 6 h is
+    the first lead EVERY model has: hourly models (Aurora 1.5) would
+    otherwise be checked at +1 h and the others at +6 h, giving spreads that
+    look comparable but are not.
     """
     if ENSEMBLE_DIM not in ds.dims:
         raise ValueError(f"No '{ENSEMBLE_DIM}' dimension; not an ensemble forecast")
@@ -43,9 +48,9 @@ def first_lead_spread(ds: xr.Dataset, variable: str | None = None) -> float:
 
     if "lead_time" in da.dims:
         hours = da["lead_time"].values / np.timedelta64(1, "h")
-        positive = np.flatnonzero(hours > 0)
+        positive = np.flatnonzero(hours >= max(min_lead_hours, 1e-9))
         if positive.size == 0:
-            raise ValueError("No lead time after the initial condition")
+            raise ValueError(f"No lead time of at least {min_lead_hours} h")
         da = da.isel(lead_time=int(positive[np.argmin(hours[positive])]))
 
     return float(da.std(dim=ENSEMBLE_DIM).max())

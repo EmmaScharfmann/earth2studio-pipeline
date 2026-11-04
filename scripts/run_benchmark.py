@@ -97,16 +97,19 @@ UV_INDEX_ARGS = [
 #
 # run_benchmark cannot import backends to ask (that would pull in torch),
 # so this list has to be kept in step with backends.BACKEND_FACTORIES.
-STOCHASTIC_MODELS = {"aifs-ens1.0", "aurora1.5-ens", "atlas", "atlas-crps"}
+STOCHASTIC_MODELS = {"aifs-ens1.0", "aurora1.5-ens", "aurora1.5-ens-6h",
+                     "atlas", "atlas-crps"}
 
-# Each model's NATIVE step length in hours. Earth2Studio's Aurora 1.5
-# wrapper emits hourly lead times (it queries the 6-hour autoregressive
-# step at t+1h..t+6h before advancing the state, so the finer output costs
-# no extra model evaluations); everything else steps 6-hourly.
+# Each model's OUTPUT step in hours. Earth2Studio's hourly Aurora 1.5
+# wrappers query the 6-hour autoregressive step at t+1h..t+6h before
+# advancing the state. Each of those queries is a separate forward pass
+# (Earth2Studio's _forward_sub_steps loops over the lead hours), so hourly
+# output costs SIX model evaluations per 6 h cycle, not one. The *-6h
+# variants query only t+6h. Everything else steps 6-hourly.
 MODEL_STEP_HOURS = {
     "aurora": 6, "atlas": 6, "atlas-crps": 6,
     "aifs1.0": 6, "aifs1.1": 6, "aifs-ens1.0": 6,
-    "aurora1.5": 1, "aurora1.5-ens": 1,
+    "aurora1.5": 1, "aurora1.5-ens": 1, "aurora1.5-ens-6h": 6,
 }
 
 # --n-steps counts steps of THIS cadence, for every model. Without the
@@ -426,7 +429,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--models", nargs="+", required=True,
-        choices=["aurora", "aurora1.5", "aurora1.5-ens", "atlas", "atlas-crps",
+        choices=["aurora", "aurora1.5", "aurora1.5-ens", "aurora1.5-ens-6h",
+                 "atlas", "atlas-crps",
          "aifs1.0", "aifs1.1", "aifs-ens1.0"],
     )
     parser.add_argument(

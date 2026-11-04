@@ -159,7 +159,8 @@ class StochasticModelBackend(ModelBackend):
         return out_zarr
 
 
-def _aurora1p5_backend(ensemble: bool = False, n_members: int = 1):
+def _aurora1p5_backend(ensemble: bool = False, n_members: int = 1,
+                       six_hourly: bool = False):
     """Aurora 1.5.
 
     NOTE on comparability: Aurora 1.5 was pretrained on ERA5 and fine-tuned
@@ -168,7 +169,16 @@ def _aurora1p5_backend(ensemble: bool = False, n_members: int = 1):
     the same mismatch penalty the AIFS models do. That makes v1.5-vs-AIFS a
     fairer comparison than v1-vs-AIFS was, and it means the ERA5-vs-IFS
     truth question now applies to both families rather than only one."""
-    if ensemble:
+    if ensemble and six_hourly:
+        # Same stochastic checkpoint as aurora1.5-ens, but queried only at
+        # the 6 h autoregressive boundary. The hourly variant runs one full
+        # forward pass PER OUTPUT HOUR (Earth2Studio's _forward_sub_steps
+        # loops over lead hours), so it costs 6x the GPU time for a 6-hourly
+        # benchmark and writes 6x the data. Use this one for scoring on the
+        # 6-hourly axis shared with AIFS and Atlas.
+        from earth2studio.models.px import Aurora1p5Ensemble_6h as Model
+        name = "aurora1.5-ens-6h"
+    elif ensemble:
         from earth2studio.models.px import Aurora1p5Ensemble as Model
         name = "aurora1.5-ens"
     else:
@@ -233,6 +243,10 @@ BACKEND_FACTORIES: dict[str, Callable[[], ModelBackend]] = {
     # condition give independent members, so --n-members works here the
     # same way it does for aifs-ens1.0.
     "aurora1.5-ens": lambda: _aurora1p5_backend(ensemble=True, n_members=1),
+    # Same checkpoint, 6-hourly output only: 6x cheaper when hourly leads
+    # are not needed (see _aurora1p5_backend).
+    "aurora1.5-ens-6h": lambda: _aurora1p5_backend(ensemble=True, n_members=1,
+                                                   six_hourly=True),
     # Generative (stochastic interpolant), so --n-members works here too.
     "atlas": lambda: _atlas_backend(n_members=1),
     # CRPS-trained ensemble variant -- the right Atlas for probabilistic
