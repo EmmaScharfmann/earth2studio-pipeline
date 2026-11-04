@@ -14,6 +14,8 @@ Useful options
     --dry-run                    list the jobs that would run, run nothing
     --season JJA --year 2025     another period without editing the config
     --start 2026-07-01 --end 2026-07-07
+    --shard 3 --num-shards 8     only this GPU's share of the jobs (balanced
+                                 by expected cost; see scripts/slurm/)
 """
 
 from __future__ import annotations
@@ -27,7 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from weather_pipeline.season import config as season_config  # noqa: E402
 from weather_pipeline.season.forecast import run_forecasts  # noqa: E402
-from weather_pipeline.season.schedule import build_jobs, status  # noqa: E402
+from weather_pipeline.season.schedule import (build_jobs, expected_minutes,  # noqa: E402
+                                              shard_jobs, status)
 
 logger = logging.getLogger("run_season")
 
@@ -39,6 +42,9 @@ def main() -> int:
     parser.add_argument("--models", nargs="+", default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--shard", type=int, default=None,
+                        help="0-based index of this process's share of the jobs")
+    parser.add_argument("--num-shards", type=int, default=1)
     period = parser.add_argument_group("period override")
     period.add_argument("--season", choices=sorted(season_config.SEASONS))
     period.add_argument("--year", type=int)
@@ -62,21 +68,35 @@ def main() -> int:
     cfg = season_config.load(args.config, **overrides)
     print(cfg.describe())
 
+    if args.shard is not None and args.num_shards < 2:
+        parser.error("--shard needs --num-shards >= 2")
+
     if args.stage == "status":
-        counts = status(cfg, build_jobs(cfg, args.models))
+        jobs = build_jobs(cfg, args.models)
+        counts = status(cfg, jobs)
         for model, c in counts.items():
             print(f"  {model:18s} {c['done']:4d} done  {c['pending']:4d} pending")
+        if args.num_shards > 1:
+            print(f"  balance over {args.num_shards} shards (expected minutes, all jobs):")
+            for s in range(args.num_shards):
+                mine = shard_jobs(jobs, s, args.num_shards)
+                print(f"    shard {s}: {len(mine):3d} jobs, {expected_minutes(mine):6.0f} min")
         return 0
 
-    summary = run_forecasts(cfg, args.models, args.limit, args.dry_run)
+    summary = run_forecasts(cfg, args.models, args.limit, args.dry_run,
+                            args.shard, args.num_shards)
     print(f"\nran {len(summary['ran'])}, failed {len(summary['failed'])}, "
           f"already done {summary['skipped']}")
     for r in summary["ran"]:
         print(f"  {r['job']}: {r['seconds'] / 60:.1f} min")
     if summary["ran"]:
         per_job = sum(r["seconds"] for r in summary["ran"]) / len(summary["ran"])
-        remaining = sum(c["pending"] for c in status(cfg, build_jobs(cfg, args.models)).values())
-        print(f"  ~{per_job / 60:.1f} min per job; {remaining} job(s) left "
+        jobs = build_jobs(cfg, args.models)
+        if args.shard is not None:
+            jobs = shard_jobs(jobs, args.shard, args.num_shards)
+        remaining = sum(c["pending"] for c in status(cfg, jobs).values())
+        scope = "" if args.shard is None else f" in shard {args.shard}"
+        print(f"  ~{per_job / 60:.1f} min per job; {remaining} job(s) left{scope} "
               f"= ~{remaining * per_job / 3600:.1f} h at this rate")
     for f in summary["failed"]:
         print(f"  FAILED {f['job']}: {f['error']}")

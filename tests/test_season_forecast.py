@@ -183,3 +183,58 @@ def test_too_few_members_is_an_error(tmp_path):
     write_store(path, job.model, 2)
     with pytest.raises(ValueError, match="2 members, config scores 3"):
         F.open_forecast(cfg, job)
+
+
+# ---- sharding across GPUs ---------------------------------------------------
+
+from weather_pipeline.season import schedule as Sch  # noqa: E402
+
+
+def season_jobs(tmp_path):
+    cfg = C.from_dict({
+        "name": "s", "period": {"season": "JJA", "year": 2026}, "truths": ["era5"],
+        "models": {"aifs-ens1.0": {"members": 10}, "aurora1.5-ens-6h": {"members": 10}},
+        "output_dir": str(tmp_path)})
+    return cfg, Sch.build_jobs(cfg)
+
+
+def test_shards_cover_every_job_exactly_once(tmp_path):
+    _, jobs = season_jobs(tmp_path)
+    shards = [Sch.shard_jobs(jobs, s, 8) for s in range(8)]
+    labels = [j.label for sh in shards for j in sh]
+    assert sorted(labels) == sorted(j.label for j in jobs)
+    assert len(labels) == len(set(labels))
+
+
+def test_shards_are_balanced_by_cost_not_count(tmp_path):
+    _, jobs = season_jobs(tmp_path)
+    loads = [Sch.expected_minutes(Sch.shard_jobs(jobs, s, 8)) for s in range(8)]
+    # within one Aurora job of each other (LPT bound), and close to the mean
+    assert max(loads) - min(loads) <= Sch.JOB_MINUTES["aurora1.5-ens-6h"]
+    assert max(loads) < 1.05 * sum(loads) / 8
+    # every GPU gets both models, rather than one model per GPU
+    assert all(len({j.model for j in Sch.shard_jobs(jobs, s, 8)}) == 2 for s in range(8))
+
+
+def test_shard_membership_does_not_depend_on_progress(tmp_path, fake_runner):
+    cfg, jobs = season_jobs(tmp_path)
+    before = [j.label for j in Sch.shard_jobs(jobs, 3, 8)]
+    F.run_forecasts(cfg, limit=5)                      # some jobs now done
+    after = [j.label for j in Sch.shard_jobs(Sch.build_jobs(cfg), 3, 8)]
+    assert before == after
+
+
+def test_shard_runs_only_its_jobs_and_logs_failures_separately(tmp_path, fake_runner):
+    cfg = make_cfg(tmp_path, days=4)
+    mine = {j.label for j in Sch.shard_jobs(build_jobs(cfg), 1, 2)}
+    first = sorted(mine)[0]
+    fake_runner.fail.add(tuple(first.split(" @ ")))
+    out = F.run_forecasts(cfg, shard=1, num_shards=2)
+    assert {r["job"] for r in out["ran"]} | {f["job"] for f in out["failed"]} == mine
+    assert (tmp_path / "test" / "forecast_failures_shard1.json").exists()
+    assert not (tmp_path / "test" / "forecast_failures.json").exists()
+
+
+def test_bad_shard_index():
+    with pytest.raises(ValueError, match="outside"):
+        Sch.shard_jobs([], 8, 8)
