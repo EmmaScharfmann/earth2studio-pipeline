@@ -280,7 +280,14 @@ def run_model_isolated(model: str, init_time: str, n_steps: int, out_zarr: str,
         # Atlas asks for TF32 cuBLAS for inference performance -- it warns
         # on every load without it, and NVIDIA's own examples set it.
         env["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = "1"
-    if model == "atlas":
+    if model.startswith("atlas"):
+        # Every Atlas variant gets the torch-harmonics source build (the
+        # prefix match in _extra_uv_args), so every variant needs this too.
+        # It used to be set for "atlas" only, so atlas-crps compiled a
+        # CPU-only extension. uv's build cache does not key on this variable:
+        # after changing it, `uv cache clean torch-harmonics` to force a
+        # rebuild.
+        #
         # torch-harmonics only compiles its CUDA kernels when this is set;
         # earth2studio's own install docs use it for the same package.
         # Without it the source build produces a CPU-only extension, which
