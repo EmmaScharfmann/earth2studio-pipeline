@@ -363,6 +363,9 @@ class ARCOERA5Source(ArraylakeERA5Source):
         # the attributes give a date: the whole day is covered
         self.last_time = pd.Timestamp(stop) + pd.Timedelta(hours=23)
         self.last_final = pd.Timestamp(attrs.get("valid_time_stop", stop)) + pd.Timedelta(hours=23)
+        # constant fields (statics.load_statics) are read at this time: inside
+        # final ERA5, rather than the store's first hour in 1940
+        self.static_time = self.last_final.normalize()
         super().__init__(ds, ds)
         logger.info("ARCO-ERA5: final ERA5 to %s, ERA5T to %s",
                     self.last_final.date(), self.last_time.date())

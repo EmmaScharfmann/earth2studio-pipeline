@@ -29,7 +29,9 @@ logger = logging.getLogger(__name__)
 
 # anemoi field name -> candidate names in the ERA5 repo (coords or vars)
 STATIC_ALIASES: dict[str, list[str]] = {
-    "z": ["z_sfc", "z", "geopotential"],
+    # ARCO-ERA5 keeps surface and pressure-level fields in one dataset, where
+    # "geopotential" is the 37-level field: its surface name must come first.
+    "z": ["z_sfc", "z", "geopotential_at_surface", "geopotential"],
     "lsm": ["lsm", "land_sea_mask"],
     "sdor": ["sdor", "standard_deviation_of_orography"],
     "slor": ["slor", "slope_of_sub_gridscale_orography"],
@@ -67,11 +69,22 @@ def load_statics(source) -> dict[str, xr.DataArray]:
             missing[name] = candidates
             continue
         da = ds[match]
-        # these are constant, but the stored array may still carry a
-        # degenerate time-ish dim depending on how it was written
+        # these are constant, but the stored array may still carry a time
+        # dim. Sources with a full time axis (ARCO-ERA5: hourly since 1940)
+        # say which time to read; otherwise the first entry is used.
+        static_time = getattr(source, "static_time", None)
         for dim in ("time", "valid_time", "step", "number"):
             if dim in da.dims:
-                da = da.isel({dim: 0}, drop=True)
+                if dim == "time" and static_time is not None:
+                    da = da.sel(time=static_time, drop=True)
+                else:
+                    da = da.isel({dim: 0}, drop=True)
+        if set(da.dims) != {"lat", "lon"}:
+            raise ValueError(
+                f"Constant field {name} resolved to '{match}' with dims {da.dims}; "
+                "expected (lat, lon). A pressure-level field of the same name? "
+                "Put the surface name earlier in STATIC_ALIASES."
+            )
         out[name] = source._fix_grid(da).load()
         logger.info("Static field %s <- %s %s", name, match, dict(out[name].sizes))
 

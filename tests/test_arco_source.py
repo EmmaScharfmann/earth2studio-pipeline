@@ -27,6 +27,8 @@ def fake_arco():
             "geopotential_at_surface": (("time", "latitude", "longitude"), np.full(shape2, 111.0)),
             "land_sea_mask": (("time", "latitude", "longitude"), np.ones(shape2)),
             "sea_ice_cover": (("time", "latitude", "longitude"), np.full(shape2, 0.25)),
+            "standard_deviation_of_orography": (("time", "latitude", "longitude"), np.full(shape2, 5.0)),
+            "slope_of_sub_gridscale_orography": (("time", "latitude", "longitude"), np.full(shape2, 0.1)),
             "geopotential": (("time", "level", "latitude", "longitude"),
                              np.broadcast_to(LEV[None, :, None, None] * 10.0,
                                              (TIME.size, LEV.size, LAT.size, LON.size)).copy()),
@@ -86,3 +88,23 @@ def test_sea_ice_comes_from_the_open_store(src, monkeypatch):
                         lambda *a, **k: pytest.fail("reopened ARCO via sea_ice.py"))
     da = src(["2026-09-01T06"], ["sic", "t2m"])
     assert float(da.sel(variable="sic").max()) == 0.25
+
+
+def test_aifs_statics_are_surface_fields_at_a_covered_time(src):
+    """The AIFS constant fields: surface geopotential, not the 37-level
+    one, read inside final ERA5 (here the first hour is NaN on purpose)."""
+    from weather_pipeline.statics import load_statics
+    src.single["land_sea_mask"][0] = np.nan
+    out = load_statics(src)
+    assert set(out) == {"z", "lsm", "sdor", "slor"}
+    for name, da in out.items():
+        assert da.dims == ("lat", "lon"), name
+        assert not np.isnan(da.values).any(), name
+    assert float(out["z"].max()) == 111.0
+
+
+def test_static_with_extra_dims_is_rejected(src, monkeypatch):
+    import weather_pipeline.statics as statics
+    monkeypatch.setitem(statics.STATIC_ALIASES, "z", ["geopotential"])   # the old bug
+    with pytest.raises(ValueError, match="expected .lat, lon."):
+        statics.load_statics(src)
