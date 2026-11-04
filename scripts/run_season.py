@@ -7,11 +7,15 @@ Seasonal evaluation, stage by stage.
 Stages
     status     how many forecasts are done / pending per model
     forecast   run the pending forecasts (GPU), resumable: rerun to continue
+    score      score every finished forecast against each truth (CPU); only
+               new or changed forecasts are scored, so rerun it any time
 
 Useful options
     --models aifs-ens1.0         only these models (must be in the config)
     --limit 3                    run at most 3 pending jobs, e.g. a first test
     --dry-run                    list the jobs that would run, run nothing
+    --truths ifs_fc0             score against these truths only
+    --force                      rescore cases that are already scored
     --season JJA --year 2025     another period without editing the config
     --start 2026-07-01 --end 2026-07-07
     --shard 3 --num-shards 8     only this GPU's share of the jobs (balanced
@@ -29,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from weather_pipeline.season import config as season_config  # noqa: E402
 from weather_pipeline.season.forecast import run_forecasts  # noqa: E402
+from weather_pipeline.season.score import run_scoring  # noqa: E402
 from weather_pipeline.season.schedule import (build_jobs, expected_minutes,  # noqa: E402
                                               shard_jobs, status)
 
@@ -38,7 +43,9 @@ logger = logging.getLogger("run_season")
 def main() -> int:
     parser = argparse.ArgumentParser(description="Seasonal evaluation of AI ensembles")
     parser.add_argument("config")
-    parser.add_argument("--stage", choices=["status", "forecast"], default="status")
+    parser.add_argument("--stage", choices=["status", "forecast", "score"], default="status")
+    parser.add_argument("--truths", nargs="+", default=None)
+    parser.add_argument("--force", action="store_true")
     parser.add_argument("--models", nargs="+", default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
@@ -82,6 +89,14 @@ def main() -> int:
                 mine = shard_jobs(jobs, s, args.num_shards)
                 print(f"    shard {s}: {len(mine):3d} jobs, {expected_minutes(mine):6.0f} min")
         return 0
+
+    if args.stage == "score":
+        out = run_scoring(cfg, args.models, args.truths, args.force)
+        print(f"\n{out['finished_forecasts']} finished forecast(s): scored {out['scored']}, "
+              f"already up to date {out['up_to_date']}, failed {len(out['failed'])}")
+        for f in out["failed"]:
+            print(f"  FAILED {f}")
+        return 1 if out["failed"] else 0
 
     summary = run_forecasts(cfg, args.models, args.limit, args.dry_run,
                             args.shard, args.num_shards)
