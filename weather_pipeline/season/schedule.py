@@ -10,6 +10,7 @@ what the config asks for (forecast_runner.existing_forecast_matches).
 
 from __future__ import annotations
 
+import heapq
 from collections import Counter
 from dataclasses import dataclass
 
@@ -20,6 +21,15 @@ from ..forecast_runner import (BENCHMARK_STEP_HOURS, MODEL_STEP_HOURS,
 from .config import SeasonConfig
 
 INIT_FMT = "%Y-%m-%dT%H:%M:%S"     # the form run_benchmark passes to models
+
+# Minutes per job (10 members to +120 h, H100), measured on the first run.
+# Only RELATIVE values matter: they balance the GPUs in shard_jobs. A model
+# missing here counts as DEFAULT_JOB_MINUTES; refine it once measured.
+JOB_MINUTES = {
+    "aifs-ens1.0": 2.3,
+    "aurora1.5-ens-6h": 6.5,
+}
+DEFAULT_JOB_MINUTES = 5.0
 
 
 @dataclass(frozen=True)
@@ -68,6 +78,36 @@ def build_jobs(cfg: SeasonConfig, models: list[str] | None = None) -> list[Job]:
             jobs.append(Job(spec.name, init_str, spec.members, cfg.n_steps,
                             store_path(cfg, spec.name, init_str)))
     return jobs
+
+
+def shard_jobs(jobs: list[Job], shard: int, num_shards: int) -> list[Job]:
+    """The jobs GPU `shard` (0-based) of `num_shards` should run.
+
+    Longest-processing-time-first: jobs sorted by expected cost, each given
+    to the least-loaded shard. Splitting every n-th job instead would hand
+    whole models to single GPUs (the job list alternates models), leaving the
+    fast models' GPUs idle while the slow ones run.
+
+    Computed from the FULL job list, never the pending one, so a job always
+    belongs to the same shard: rerunning the same array resumes each shard
+    without two GPUs ever picking up the same forecast. Within a shard the
+    original (initialisation-major) order is kept.
+    """
+    if not 0 <= shard < num_shards:
+        raise ValueError(f"shard {shard} outside 0..{num_shards - 1}")
+    order = sorted(range(len(jobs)),
+                   key=lambda i: (-JOB_MINUTES.get(jobs[i].model, DEFAULT_JOB_MINUTES), i))
+    heap = [(0.0, s) for s in range(num_shards)]
+    owner = {}
+    for i in order:
+        load, s = heapq.heappop(heap)
+        owner[i] = s
+        heapq.heappush(heap, (load + JOB_MINUTES.get(jobs[i].model, DEFAULT_JOB_MINUTES), s))
+    return [job for i, job in enumerate(jobs) if owner[i] == shard]
+
+
+def expected_minutes(jobs: list[Job]) -> float:
+    return sum(JOB_MINUTES.get(j.model, DEFAULT_JOB_MINUTES) for j in jobs)
 
 
 def is_done(job: Job, cfg: SeasonConfig) -> bool:

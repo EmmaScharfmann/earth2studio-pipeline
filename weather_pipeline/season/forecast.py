@@ -41,7 +41,7 @@ import xarray as xr
 from .. import forecast_runner
 from ..ensemble_checks import DegenerateEnsembleError
 from .config import SeasonConfig
-from .schedule import Job, build_jobs, is_done, season_dir
+from .schedule import Job, build_jobs, is_done, season_dir, shard_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +51,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def run_forecasts(cfg: SeasonConfig, models: list[str] | None = None,
-                  limit: int | None = None, dry_run: bool = False) -> dict:
-    """Run pending jobs. Returns {"ran": [...], "failed": [...], "skipped": n}."""
+                  limit: int | None = None, dry_run: bool = False,
+                  shard: int | None = None, num_shards: int = 1) -> dict:
+    """Run pending jobs. Returns {"ran": [...], "failed": [...], "skipped": n}.
+
+    With `shard`/`num_shards`, only this shard's jobs (see shard_jobs), so
+    one process per GPU can share a season without overlap."""
     jobs = build_jobs(cfg, models)
+    if shard is not None:
+        jobs = shard_jobs(jobs, shard, num_shards)
     pending = [j for j in jobs if not is_done(j, cfg)]
     skipped = len(jobs) - len(pending)
     if limit is not None:
@@ -77,15 +83,17 @@ def run_forecasts(cfg: SeasonConfig, models: list[str] | None = None,
         except (subprocess.CalledProcessError, DegenerateEnsembleError, OSError) as exc:
             logger.error("FAILED %s: %s", job.label, exc)
             failed.append({"job": job.label, "error": f"{type(exc).__name__}: {exc}"})
-            _write_failures(cfg, failed)
+            _write_failures(cfg, failed, shard)
             continue
         ran.append({"job": job.label, "seconds": round(time.monotonic() - started)})
 
     return {"ran": ran, "failed": failed, "skipped": skipped}
 
 
-def _write_failures(cfg: SeasonConfig, failed: list[dict]) -> None:
-    path = forecast_runner.REPO_ROOT / season_dir(cfg) / "forecast_failures.json"
+def _write_failures(cfg: SeasonConfig, failed: list[dict], shard: int | None = None) -> None:
+    """One file per shard, so parallel processes never overwrite each other."""
+    name = "forecast_failures.json" if shard is None else f"forecast_failures_shard{shard}.json"
+    path = forecast_runner.REPO_ROOT / season_dir(cfg) / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(failed, indent=2))
 
