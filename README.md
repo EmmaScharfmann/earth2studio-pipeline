@@ -41,7 +41,7 @@ Ensemble runs whose members come out identical are rejected before they are reco
 
 ## Seasonal evaluation (in progress)
 
-`weather_pipeline/season/` evaluates AI ensembles over a season, following the probabilistic protocol of Wessel et al. (arXiv:2610.20519). The period is an input (`configs/summer2026_france.yaml`: `period: {season: JJA, year: 2026}` or explicit dates). Truths are ERA5 and the step-0 HRES field from ECMWF open data (`weather_pipeline/ifs_opendata.py`, 2024 onward); `season/scores.py` holds the fair, additive scores.
+`weather_pipeline/season/` evaluates AI ensembles over a season, following the probabilistic protocol of Wessel et al. (arXiv:2610.20519). The period is an input (`configs/summer2026_france.yaml`: `period: {season: JJA, year: 2026}` or explicit dates). Truths are ERA5 and the step-0 HRES field from ECMWF open data (`weather_pipeline/ifs_opendata.py`, 2024 onward); `season/metrics.py` holds the fair, additive scores.
 
 ```bash
 uv run scripts/run_season.py configs/summer2026_france.yaml --stage status

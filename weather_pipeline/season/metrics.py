@@ -21,7 +21,8 @@ Design
 
 Scores
 ------
-overall      fair CRPS, scaled CRPS, Dawid-Sebastiani, ens-mean MSE,
+overall      bias (ensemble-mean minus truth), fair CRPS, scaled CRPS,
+             Dawid-Sebastiani, ens-mean MSE,
              MSE / frequency of large errors (SE > 4 K^2), fair
              spread-skill ratio (overall and binned by spread), randomised
              PIT histogram, fair energy score (per case, spatial field)
@@ -30,6 +31,9 @@ extremes     fair Brier score and fair twCRPS per threshold, occurrence
              fraction of exceedances above every member (record miss rate
              at the top threshold), ens-mean squared error on exceedances
              (not proper; reported for comparability only)
+maps         per grid cell and forecast day (day 1 = leads 1-24 h, ...):
+             summed CRPS, error, squared error and variance, for maps and
+             elevation breakdowns (finalise_maps)
 """
 
 from __future__ import annotations
@@ -41,6 +45,10 @@ LARGE_ERROR_K2 = 4.0          # paper: squared error > 4 K^2
 PIT_BINS = 20
 CPIT_BINS = 200               # fine bins: KS from the histogram is exact to 1/200
 SPREAD_EDGES_K = np.array([0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, np.inf])
+
+# Bumped whenever case_statistics gains or changes a variable, so the
+# scoring stage rescores files written by an older version.
+STATS_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +230,7 @@ def case_statistics(
 
     data = {
         "weight": ("lead_time", _wsum(np.ones_like(y), w)),
+        "err": ("lead_time", _wsum(mu - y, w)),
         "crps": ("lead_time", _wsum(crps_fair(ens, y), w)),
         "scrps": ("lead_time", _wsum(np.where(use, scrps(ens, y), 0.0), w)),
         "dss": ("lead_time", _wsum(np.where(use, dawid_sebastiani(ens, y), 0.0), w)),
@@ -295,8 +304,26 @@ def case_statistics(
         coords["quantile"] = thresholds["quantile"].values
         coords["cpit_bin"] = np.arange(CPIT_BINS)
 
+    # per-cell sums by forecast day, NaN off the weighted domain. Unweighted
+    # within a cell: area weights come back when cells are aggregated.
+    hours = lead / np.timedelta64(1, "h")
+    day = np.ceil(hours / 24).astype(int)
+    days = np.unique(day)
+    crps_cells = crps_fair(ens, y)
+    maps = {"map_crps": crps_cells, "map_err": mu - y, "map_se": se, "map_var": var}
+    for name, values in maps.items():
+        out = np.full((len(days),) + y.shape[1:], np.nan, dtype="float32")
+        for k, d in enumerate(days):
+            out[k] = np.where(use, values[day == d].sum(axis=0), np.nan)
+        data[name] = (("lead_day", *spatial), out)
+    data["map_n"] = ("lead_day", np.array([(day == d).sum() for d in days], dtype=float))
+    coords["lead_day"] = days
+    for dim in spatial:
+        coords[dim] = obs[dim].values
+
     ds = xr.Dataset(data, coords=coords)
     ds.attrs["n_members"] = m
+    ds.attrs["stats_version"] = STATS_VERSION
     return ds
 
 
@@ -312,6 +339,7 @@ def finalise(stats: xr.Dataset) -> xr.Dataset:
     fair = (m + 1) / m           # Fortin et al. 2014: E[SE] = (M+1)/M E[var]
     out = {
         "crps": stats["crps"] / w,
+        "bias": stats["err"] / w,
         "scrps": stats["scrps"] / w,
         "dss": stats["dss"] / w,
         "ens_mean_rmse": np.sqrt(stats["se"] / w),
@@ -337,6 +365,41 @@ def finalise(stats: xr.Dataset) -> xr.Dataset:
             "cpit_ks": cpit_ks(stats["cpit_hist"]),
         })
     return xr.Dataset(out)
+
+
+def finalise_maps(stats: xr.Dataset) -> xr.Dataset:
+    """Per-cell metrics by forecast day from summed statistics: CRPS, bias,
+    ensemble-mean RMSE and spread. NaN off the land domain."""
+    m = stats.attrs["n_members"]
+    n = stats["map_n"]
+    return xr.Dataset({
+        "crps": stats["map_crps"] / n,
+        "bias": stats["map_err"] / n,
+        "ens_mean_rmse": np.sqrt(stats["map_se"] / n),
+        "spread": np.sqrt(stats["map_var"] / n),
+        "spread_skill": np.sqrt((m + 1) / m * stats["map_var"] / stats["map_se"]),
+    })
+
+
+def by_band(stats: xr.Dataset, band_of_cell: xr.DataArray, weights: xr.DataArray) -> xr.Dataset:
+    """CRPS, bias and RMSE per forecast day for groups of cells (e.g.
+    elevation bands), area-weighted: sum(w * cell sums) / sum(w * n)."""
+    m = stats.attrs["n_members"]
+    out = {}
+    on_domain = band_of_cell.values[(weights > 0).values]
+    present = set(on_domain[on_domain != None])  # noqa: E711  (object array)
+    order = band_of_cell.attrs.get("order") or sorted(present)
+    for band in [b for b in order if b in present]:   # bands with no weighted cell are skipped
+        w = weights.where(band_of_cell == band, 0.0)
+        denom = (w * stats["map_n"]).sum(("lat", "lon"))
+        tot = {k: (w * stats[f"map_{k}"].fillna(0)).sum(("lat", "lon")) for k in ("crps", "err", "se", "var")}
+        out[str(band)] = xr.Dataset({
+            "crps": tot["crps"] / denom, "bias": tot["err"] / denom,
+            "ens_mean_rmse": np.sqrt(tot["se"] / denom),
+            "spread_skill": np.sqrt((m + 1) / m * tot["var"] / tot["se"]),
+            "cells": (w > 0).sum(),
+        })
+    return xr.concat(list(out.values()), dim=xr.DataArray(list(out), dims="band", name="band"))
 
 
 def cpit_ks(hist: xr.DataArray) -> xr.DataArray:

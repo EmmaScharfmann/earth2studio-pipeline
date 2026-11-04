@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from weather_pipeline.season import config as season_config  # noqa: E402
 from weather_pipeline.season.forecast import run_forecasts  # noqa: E402
-from weather_pipeline.season.score import run_scoring  # noqa: E402
+from weather_pipeline.season.scoring import run_scoring  # noqa: E402
 from weather_pipeline.season.schedule import (build_jobs, expected_minutes,  # noqa: E402
                                               shard_jobs, status)
 

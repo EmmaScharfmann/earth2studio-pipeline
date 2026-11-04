@@ -9,7 +9,7 @@ import pytest
 import xarray as xr
 
 from weather_pipeline import forecast_runner
-from weather_pipeline.season import score as SC
+from weather_pipeline.season import scoring as SC
 from weather_pipeline.season import forecast as F
 from weather_pipeline.season.schedule import build_jobs
 
@@ -29,6 +29,10 @@ class FakeTruth:
         times = list(pd.to_datetime(list(times)))
         self.requested += times
         data = 290 + self.offset + np.zeros((len(times), len(variables), GLAT.size, GLON.size))
+        if variables == ["z_surface"]:
+            # height rising southward through the France box: 0..2600 m
+            data = np.broadcast_to((np.arange(GLAT.size) - 140)[:, None].clip(0) * 50.0 * 9.80665,
+                                   data.shape).copy()
         if variables == ["lsm"]:
             data = np.zeros_like(data)
             data[..., : GLAT.size // 2, :] = 1.0          # northern hemisphere = land
@@ -119,3 +123,43 @@ def test_unknown_truth_is_rejected(season):
     cfg, sources = season
     with pytest.raises(ValueError, match="not among"):
         run(cfg, sources, truths=["stations"])
+
+
+
+def test_bias_maps_and_elevation_bands(season):
+    cfg, sources = season
+    run(cfg, sources)
+    st = SC.load_statistics(cfg, "ifs_fc0")["aifs-ens1.0"]
+    maps = SC.season_maps(st)
+    w = SC.land_weights(cfg)
+    land = (w > 0).values
+    assert np.isfinite(maps["crps"].values[:, land]).all()
+    assert np.isnan(maps["crps"].values[:, ~land]).all()      # sea NaN after summing cases
+    h = SC.elevation(cfg, source=FakeTruth())
+    assert float(h.min()) >= 0 and float(h.max()) > 1500
+    bands = SC.elevation_bands(h)
+    banded = SC.metrics.by_band(SC.summed(st), bands, w)
+    # land-only bands, in elevation order; the fake sea strip spans 500-1000 m
+    assert list(banded["band"].values) == ["200-500 m", "1000-1500 m", ">1500 m"]
+    assert np.isfinite(banded["crps"]).all() and (banded["cells"] > 0).all()
+
+
+def test_truth_disagreement_from_the_caches(season):
+    cfg, sources = season
+    run(cfg, sources)
+    d = SC.truth_disagreement(cfg, "era5", "ifs_fc0")
+    # FakeTruth: ifs_fc0 = era5 + 0.5 K everywhere
+    np.testing.assert_allclose(d["mean_diff"], -0.5)
+    np.testing.assert_allclose(d["rms_diff"], 0.5)
+    land = (SC.land_weights(cfg) > 0).values
+    assert np.isnan(d["map_rms_diff"].values[~land]).all()
+    assert d.attrs["n_times"] == len(d["time"])
+
+
+def test_files_from_an_older_stats_version_are_rescored(season):
+    cfg, sources = season
+    run(cfg, sources)
+    path = next((SC._root(cfg) / "scores" / "era5").glob("*.nc"))
+    ds = xr.open_dataset(path).load(); ds.attrs["stats_version"] = 1
+    ds.to_netcdf(path.with_suffix(".tmp")); path.with_suffix(".tmp").rename(path)
+    assert run(cfg, sources)["scored"] == 1
