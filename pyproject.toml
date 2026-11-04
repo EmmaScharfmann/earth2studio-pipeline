@@ -71,4 +71,4 @@ torch = { index = "pytorch-cu130" }
 weatherbenchX = { git = "https://github.com/google-research/weatherbenchX.git" }
 
 [dependency-groups]
-dev = ["pytest"]
+dev = ["pytest", "scoringrules"]   # scoringrules: independent cross-checks of season/scores.py
