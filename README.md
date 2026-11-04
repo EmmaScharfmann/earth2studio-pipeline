@@ -13,6 +13,8 @@ The base environment holds data access, scoring and plotting only. Each model's 
 Earth2Studio pins live in `requirements/<model>.txt` and are layered on top per run, so models
 with conflicting pins never share an environment.
 
+Python 3.12 is required (pinned in `.python-version`): the AIFS environments use flash-attn and torch wheels built for 3.12 only.
+
 ```bash
 uv sync
 uv run arraylake auth login        # or export ARRAYLAKE_TOKEN=ema_...

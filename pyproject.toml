@@ -2,7 +2,11 @@
 name = "earth2studio-pipeline"
 version = "0.1.0"
 description = "Open benchmark harness for Earth2Studio weather models"
-requires-python = ">=3.12"
+# Exactly 3.12: the AIFS requirements pin prebuilt flash-attn and torch 2.5
+# wheels for CPython 3.12 (cp312). On 3.13 uv resolves an environment
+# WITHOUT flash-attn and AIFS fails at checkpoint load with
+# "No module named 'flash_attn'". .python-version pins the same.
+requires-python = ">=3.12,<3.13"
 # Deliberately model-agnostic: numpy/xarray/plotting/data-access only.
 # torch + earth2studio[<model>] + any model-specific packages (anemoi,
 # aurora, ...) live in requirements/<model>.txt instead, layered on top of

@@ -286,6 +286,35 @@ def crop_coords(region: Region) -> tuple[np.ndarray, np.ndarray]:
     return OUT_LAT[lat_idx], OUT_LON[lon_idx]
 
 
+def _require_flash_attn() -> None:
+    """AIFS checkpoints are pickled with references to flash-attn, so a
+    missing flash-attn only surfaces when anemoi unpickles the model -- after
+    the initial conditions are fetched and the checkpoint is loaded, buried
+    under anemoi's environment report. Check first, and say why it is missing.
+
+    The usual cause is the Python version: requirements/aifs*.txt pin a
+    prebuilt flash-attn wheel for CPython 3.12 (cp312), which cannot install
+    on any other Python. The project pins 3.12 in .python-version for this
+    reason."""
+    try:
+        import flash_attn  # noqa: F401
+    except ImportError as exc:
+        import sys
+        version = ".".join(map(str, sys.version_info[:3]))
+        if sys.version_info[:2] != (3, 12):
+            hint = ("The AIFS requirements pin a flash-attn wheel built for "
+                    "Python 3.12 only. Check that .python-version says 3.12 "
+                    "(`uv python pin 3.12`), then rerun.")
+        else:
+            hint = (f"Python is 3.12, so the wheel itself did not install or "
+                    f"import: {exc}. Check that the flash-attn URL in "
+                    "requirements/aifs*.txt matches the pinned torch version "
+                    "and C++ ABI (see the comment there).")
+        raise RuntimeError(
+            f"flash-attn is not available in this environment (Python {version}). {hint}"
+        ) from exc
+
+
 @dataclass
 class AnemoiBackend:
     """Mirrors backends.ModelBackend's `.run()` signature exactly, so
@@ -460,6 +489,7 @@ class AnemoiBackend:
         out_zarr: str,
         device: str | None = None,
     ) -> str:
+        _require_flash_attn()
         runner = self._build_runner(device)
         input_state = self._build_input_state(runner, data_source, init_time)
 
