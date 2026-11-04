@@ -19,8 +19,9 @@ shared by every model and every overlapping case.
 Weights are cos(latitude) x land, land = IFS land-sea fraction > 0.5 (the
 paper's mask, from ECMWF open data, so no Arraylake login is needed for it).
 
-A case is rescored only when its forecast changed (the manifest's
-written_utc is stored with the statistics) or with force=True.
+A case is rescored when its forecast changed (the manifest's written_utc
+is stored with the statistics), when its file predates the current
+scores.STATS_VERSION, or with force=True.
 """
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 LAND_FRACTION = 0.5
 MASK_TIME = "2026-01-01T00"        # the land-sea mask is static; any date works
+GRAVITY = 9.80665
+ELEVATION_BANDS_M = [-np.inf, 200, 500, 1000, 1500, np.inf]
 
 
 def _root(cfg: SeasonConfig) -> Path:
@@ -127,6 +130,63 @@ def land_weights(cfg: SeasonConfig, mask_source=None) -> xr.DataArray:
     return w
 
 
+def elevation(cfg: SeasonConfig, source=None) -> xr.DataArray:
+    """Surface height (m) on the region's grid, from the IFS surface
+    geopotential (same source and grid as the land mask). Cached."""
+    path = _root(cfg) / "truth" / "elevation.nc"
+    if path.exists():
+        return xr.open_dataarray(path).load()
+    if source is None:
+        from ..ifs_opendata import IFSOpenDataFC0Source
+        source = IFSOpenDataFC0Source()
+    z = _crop(source([MASK_TIME], ["z_surface"]).isel(time=0).sel(variable="z_surface"), cfg.region)
+    z = z.drop_vars([c for c in z.coords if c not in ("lat", "lon")], errors="ignore")
+    h = (z / GRAVITY).transpose("lat", "lon").rename("elevation")
+    h.attrs["units"] = "m"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    h.to_netcdf(path)
+    return h
+
+
+def elevation_bands(height: xr.DataArray, edges=ELEVATION_BANDS_M) -> xr.DataArray:
+    """Label each cell with its band, e.g. '200-500 m'."""
+    labels = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        labels.append(f"<{hi:.0f} m" if not np.isfinite(lo) else
+                      f">{lo:.0f} m" if not np.isfinite(hi) else f"{lo:.0f}-{hi:.0f} m")
+    idx = np.digitize(height.values, edges[1:-1])
+    out = xr.DataArray(np.array(labels, dtype=object)[idx], coords=height.coords, dims=height.dims)
+    out.attrs["order"] = labels          # low to high, for tables and plots
+    return out
+
+
+def truth_disagreement(cfg: SeasonConfig, a: str = "era5", b: str = "ifs_fc0") -> xr.Dataset:
+    """Truth a minus truth b at every valid time cached for both, over the
+    land domain: area-weighted mean and RMS difference per valid time, and
+    per-cell mean / RMS difference maps. Read from the scorer's truth cache,
+    so it covers exactly the valid times that were scored."""
+    da, db = _root(cfg) / "truth" / a, _root(cfg) / "truth" / b
+    common = sorted({p.name for p in da.glob("*.nc")} & {p.name for p in db.glob("*.nc")})
+    if not common:
+        raise FileNotFoundError(f"No valid time cached for both {a} and {b}; run --stage score")
+    w = land_weights(cfg)
+    diffs = []
+    for name in common:
+        fa, fb = xr.open_dataarray(da / name).load(), xr.open_dataarray(db / name).load()
+        diffs.append((fa - _on_grid(fb, fa, b)).expand_dims(
+            time=[pd.to_datetime(name.split(".")[0], format="%Y%m%d%H").to_datetime64()]))
+    d = xr.concat(diffs, dim="time")
+    w = _on_grid(w, d, "land weights")
+    land = w > 0
+    wsum = w.sum()
+    return xr.Dataset({
+        "mean_diff": (d * w).sum(("lat", "lon")) / wsum,
+        "rms_diff": np.sqrt((d ** 2 * w).sum(("lat", "lon")) / wsum),
+        "map_mean_diff": d.mean("time").where(land),
+        "map_rms_diff": np.sqrt((d ** 2).mean("time")).where(land),
+    }, attrs={"a": a, "b": b, "n_times": len(common)})
+
+
 def _on_grid(field: xr.DataArray, like: xr.DataArray, what: str) -> xr.DataArray:
     """Select `field` at exactly `like`'s lat/lon (both 0.25 deg grids); a
     mismatch beyond 1e-6 deg is an error rather than a silent nearest pick."""
@@ -177,7 +237,8 @@ def run_scoring(cfg: SeasonConfig, models: list[str] | None = None,
             path = stats_path(cfg, truth_name, job)
             if not force and path.exists():
                 with xr.open_dataset(path) as old:
-                    if old.attrs.get("forecast_written_utc") == (_manifest_time(job) or ""):
+                    current = old.attrs.get("stats_version", 1) == scores.STATS_VERSION
+                    if current and old.attrs.get("forecast_written_utc") == (_manifest_time(job) or ""):
                         summary["up_to_date"] += 1
                         continue
             try:
@@ -220,7 +281,20 @@ def load_statistics(cfg: SeasonConfig, truth: str,
 
 def season_scores(stats: xr.Dataset, init_times=None) -> xr.Dataset:
     """Finalised metrics over the given init times (default: all)."""
-    sel = stats if init_times is None else stats.sel(init_time=init_times)
-    total = sel.sum("init_time")
-    total.attrs = stats.attrs
+    total = summed(stats, init_times)
     return scores.finalise(total)
+
+
+def summed(stats: xr.Dataset, init_times=None) -> xr.Dataset:
+    """Statistics summed over init times. min_count=1 keeps cells that are
+    NaN in every case (sea, outside the domain) NaN instead of turning them
+    into zeros, which would read as perfect scores on the maps."""
+    sel = stats if init_times is None else stats.sel(init_time=init_times)
+    total = sel.sum("init_time", min_count=1)
+    total.attrs = stats.attrs
+    return total
+
+
+def season_maps(stats: xr.Dataset, init_times=None) -> xr.Dataset:
+    """Per-cell metrics by forecast day over the given init times."""
+    return scores.finalise_maps(summed(stats, init_times))

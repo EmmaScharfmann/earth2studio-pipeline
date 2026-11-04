@@ -66,6 +66,7 @@ PARAMS: dict[str, tuple[str, str]] = {
     "u10m": ("10u", "sfc"),
     "v10m": ("10v", "sfc"),
     "lsm": ("lsm", "sfc"),       # land-sea fraction, for the land mask
+    "z_surface": ("z", "sfc"),   # surface geopotential (m2 s-2), for elevation
 }
 
 
