@@ -13,34 +13,7 @@ from weather_pipeline.season import scoring as SC
 from weather_pipeline.season import forecast as F
 from weather_pipeline.season.schedule import build_jobs
 
-from season_helpers import make_cfg
-
-GLAT = np.linspace(90, -90, 721)
-GLON = np.arange(0, 360, 0.25)
-
-
-class FakeTruth:
-    """A global truth source that counts which times it was asked for."""
-
-    def __init__(self, offset=0.0, lat_shift=0.0):
-        self.requested, self.offset, self.lat_shift = [], offset, lat_shift
-
-    def __call__(self, times, variables):
-        times = list(pd.to_datetime(list(times)))
-        self.requested += times
-        data = 290 + self.offset + np.zeros((len(times), len(variables), GLAT.size, GLON.size))
-        if variables == ["z_surface"]:
-            # height rising southward through the France box: 0..2600 m
-            data = np.broadcast_to((np.arange(GLAT.size) - 140)[:, None].clip(0) * 50.0 * 9.80665,
-                                   data.shape).copy()
-        if variables == ["lsm"]:
-            data = np.zeros_like(data)
-            data[..., : GLAT.size // 2, :] = 1.0          # northern hemisphere = land
-            data[..., 150:160, :] = 0.0                    # a sea strip inside France's box
-        return xr.DataArray(data, dims=("time", "variable", "lat", "lon"),
-                            coords={"time": times, "variable": variables,
-                                    "lat": GLAT + self.lat_shift, "lon": GLON})
-
+from season_helpers import FakeTruth, make_cfg
 
 @pytest.fixture
 def season(tmp_path, fake_runner):
@@ -163,3 +136,19 @@ def test_files_from_an_older_stats_version_are_rescored(season):
     ds = xr.open_dataset(path).load(); ds.attrs["stats_version"] = 1
     ds.to_netcdf(path.with_suffix(".tmp")); path.with_suffix(".tmp").rename(path)
     assert run(cfg, sources)["scored"] == 1
+
+
+def test_valid_time_window_splits_cases(season):
+    cfg, sources = season
+    run(cfg, sources)
+    st = SC.load_statistics(cfg, "era5")["aifs-ens1.0"]       # inits 1 and 2 July, leads 6..24 h
+    inside = SC.valid_time_window(st, "2026-07-02T00", "2026-07-02T23")
+    outside = SC.valid_time_window(st, "2026-07-02T00", "2026-07-02T23", inside=False)
+    # every (init, lead) pair is in exactly one of the two
+    both = SC.summed(inside)["weight"].fillna(0) + SC.summed(outside)["weight"].fillna(0)
+    np.testing.assert_allclose(both, SC.summed(st)["weight"])
+    # valid on 2 July: 1 July + 24 h, and 2 July + 6, 12, 18 h (+24 h is 3 July)
+    n_in = (~np.isnan(inside["weight"])).sum("init_time")
+    assert list(n_in.values) == [1, 1, 1, 1]
+    assert np.isnan(inside["weight"].sel(init_time="2026-07-02", lead_time=np.timedelta64(24, "h"))).all()
+    assert np.isfinite(SC.season_scores(inside)["crps"]).all()

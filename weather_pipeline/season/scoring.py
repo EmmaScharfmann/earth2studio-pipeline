@@ -295,6 +295,31 @@ def summed(stats: xr.Dataset, init_times=None) -> xr.Dataset:
     return total
 
 
+def valid_time_window(stats: xr.Dataset, start, end, inside: bool = True) -> xr.Dataset:
+    """Keep only the (init, lead) pairs whose valid time is inside [start,
+    end] (or outside, with inside=False); the others become NaN and drop out
+    of `summed` / `season_scores`.
+
+    A diagnostic, not a replacement for scores over all cases: selecting cases
+    because they turned out extreme favours forecasts that over-predict them
+    (the forecaster's dilemma). Report it next to the threshold-based scores.
+    Per-cell maps are kept only for cases whose whole forecast day is inside.
+    """
+    valid = stats["init_time"] + stats["lead_time"]
+    in_window = (valid >= np.datetime64(pd.Timestamp(start))) & (valid <= np.datetime64(pd.Timestamp(end)))
+    keep = in_window if inside else ~in_window
+    # a forecast day's map counts only if all its leads are on the kept side
+    day = np.ceil(stats["lead_time"] / np.timedelta64(1, "h") / 24).rename("lead_day")
+    keep_day = keep.groupby(day).all()
+    out = stats.copy()
+    for name, var in stats.data_vars.items():
+        if "lead_time" in var.dims:
+            out[name] = var.where(keep)
+        elif "lead_day" in var.dims:
+            out[name] = var.where(keep_day)
+    return out
+
+
 def season_maps(stats: xr.Dataset, init_times=None) -> xr.Dataset:
     """Per-cell metrics by forecast day over the given init times."""
     return metrics.finalise_maps(summed(stats, init_times))
