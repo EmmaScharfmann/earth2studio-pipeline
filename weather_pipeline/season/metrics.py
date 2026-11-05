@@ -362,8 +362,9 @@ def finalise(stats: xr.Dataset) -> xr.Dataset:
             "miss_rate": stats["miss"] / events,
             "exceed_rmse": np.sqrt(stats["exceed_se"] / events),
             "cpit_undefined_frac": stats["cpit_undefined"] / events,
-            "cpit_ks": cpit_ks(stats["cpit_hist"]),
         })
+        if "cpit_hist" in stats:      # absent from bootstrap replicates (too large)
+            out["cpit_ks"] = cpit_ks(stats["cpit_hist"])
     return xr.Dataset(out)
 
 
