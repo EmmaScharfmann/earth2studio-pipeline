@@ -108,3 +108,37 @@ def test_static_with_extra_dims_is_rejected(src, monkeypatch):
     monkeypatch.setitem(statics.STATIC_ALIASES, "z", ["geopotential"])   # the old bug
     with pytest.raises(ValueError, match="expected .lat, lon."):
         statics.load_statics(src)
+
+
+# ---- concurrent loading --------------------------------------------------------
+
+def test_parallel_fetch_matches_sequential(src, monkeypatch):
+    names = ["t2m", "z_surface", "z500", "z850", "sic", "lsm"]
+    monkeypatch.setenv("ERA5_FETCH_WORKERS", "1")
+    one = src(["2026-09-01T00", "2026-09-01T06"], names)
+    monkeypatch.setenv("ERA5_FETCH_WORKERS", "8")
+    many = src(["2026-09-01T00", "2026-09-01T06"], names)
+    xr.testing.assert_identical(one, many)
+    assert list(many["variable"].values) == names                  # order kept
+
+
+def test_loads_overlap_in_time(src, monkeypatch):
+    """With a slow store, N loads take about one load's time, not N."""
+    import time as _time
+    from weather_pipeline.datasource import ArraylakeERA5Source
+    real = ArraylakeERA5Source._load
+
+    def slow(self, v, sel):
+        _time.sleep(0.3)
+        return real(self, v, sel)
+
+    monkeypatch.setattr(ArraylakeERA5Source, "_load", slow)
+    monkeypatch.setenv("ERA5_FETCH_WORKERS", "8")
+    t0 = _time.monotonic()
+    src(["2026-09-01T00"], ["t2m", "z_surface", "z500", "z850", "sic", "lsm", "t2m", "z500"])
+    assert _time.monotonic() - t0 < 1.2                            # 8 x 0.3 s sequential = 2.4 s
+
+
+def test_unknown_variable_still_reported_before_any_fetch(src):
+    with pytest.raises(Exception, match="nonsense"):
+        src(["2026-09-01T00"], ["t2m", "nonsense"])
