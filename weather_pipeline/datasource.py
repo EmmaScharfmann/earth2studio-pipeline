@@ -12,6 +12,8 @@ each model's `input_coords()["variable"]` just drives what gets requested.
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -40,6 +42,17 @@ except ModuleNotFoundError:
         return time, variable
 
 logger = logging.getLogger(__name__)
+
+# Concurrent variable loads per fetch (ERA5_FETCH_WORKERS overrides; 1 = one
+# after another, the old behaviour).
+DEFAULT_FETCH_WORKERS = 16
+
+
+def fetch_workers() -> int:
+    try:
+        return int(os.environ.get("ERA5_FETCH_WORKERS", DEFAULT_FETCH_WORKERS))
+    except ValueError:
+        return DEFAULT_FETCH_WORKERS
 
 # ---------------------------------------------------------------------------
 # Alias tables: Earth2Studio channel id -> candidate variable names in the
@@ -279,6 +292,38 @@ class ArraylakeERA5Source:
             "different one."
         )
 
+    def _select(self, v: str, time):
+        """Lazy selection for one variable (a callable for derived ones)."""
+        if v in DERIVED_SURFACE:
+            method = getattr(self, DERIVED_SURFACE[v])
+            return lambda: xr.concat([method(t) for t in time], dim="time")
+        if v in SURFACE_ALIASES:
+            name = _first_match(_names_incl_coords(self.single), SURFACE_ALIASES[v])
+            logger.debug("  %s -> single/%s", v, name)
+            return self.single[name].sel(time=time)
+        for prefix, cands in PRESSURE_ALIASES.items():
+            if v.startswith(prefix) and v[len(prefix):].isdigit():
+                level = int(v[len(prefix):])
+                name = _first_match(_names_incl_coords(self.pl), cands)
+                logger.debug("  %s -> pressure/%s @ %s hPa", v, name, level)
+                return self.pl[name].sel(time=time, **{self.level_dim: level})
+        raise KeyError(
+            f"Don't know how to resolve Earth2Studio variable id "
+            f"'{v}' against the Arraylake ERA5 repo -- add an "
+            "alias to SURFACE_ALIASES/PRESSURE_ALIASES, or a "
+            "method to DERIVED_SURFACE if it needs to be computed."
+        )
+
+    def _load(self, v: str, selection) -> xr.DataArray:
+        da = selection() if callable(selection) else selection
+        da = da.load()  # pull only the requested slice into memory
+        da = self._fix_grid(da)
+        # Drop leftover scalar coords (e.g. the selected pressure level)
+        # that only exist on some variables -- xr.concat requires the
+        # coordinate set to match across everything being concatenated.
+        extra_coords = [c for c in da.coords if c not in ("time", "lat", "lon")]
+        return da.drop_vars(extra_coords)
+
     def __call__(self, time, variable) -> xr.DataArray:
         time, variable = prep_data_inputs(time, variable)
         logger.info(
@@ -291,40 +336,19 @@ class ArraylakeERA5Source:
         # (Aurora 1.5 asks for 83) one variable per run.
         self._check_resolvable(variable)
 
-        arrays = []
-        for v in variable:
-            if v in DERIVED_SURFACE:
-                method = getattr(self, DERIVED_SURFACE[v])
-                da = xr.concat([method(t) for t in time], dim="time")
-            elif v in SURFACE_ALIASES:
-                name = _first_match(_names_incl_coords(self.single), SURFACE_ALIASES[v])
-                logger.debug("  %s -> single/%s", v, name)
-                da = self.single[name].sel(time=time)
-            else:
-                matched = False
-                for prefix, cands in PRESSURE_ALIASES.items():
-                    if v.startswith(prefix) and v[len(prefix):].isdigit():
-                        level = int(v[len(prefix):])
-                        name = _first_match(_names_incl_coords(self.pl), cands)
-                        logger.debug("  %s -> pressure/%s @ %s hPa", v, name, level)
-                        da = self.pl[name].sel(time=time, **{self.level_dim: level})
-                        matched = True
-                        break
-                if not matched:
-                    raise KeyError(
-                        f"Don't know how to resolve Earth2Studio variable id "
-                        f"'{v}' against the Arraylake ERA5 repo -- add an "
-                        "alias to SURFACE_ALIASES/PRESSURE_ALIASES, or a "
-                        "method to DERIVED_SURFACE if it needs to be computed."
-                    )
-            da = da.load()  # pull only the requested slice into memory
-            da = self._fix_grid(da)
-            # Drop leftover scalar coords (e.g. the selected pressure level)
-            # that only exist on some variables -- xr.concat requires the
-            # coordinate set to match across everything being concatenated.
-            extra_coords = [c for c in da.coords if c not in ("time", "lat", "lon")]
-            da = da.drop_vars(extra_coords)
-            arrays.append(da.expand_dims(variable=[v]))
+        # Resolve every variable to a lazy selection (cheap), then load them
+        # concurrently. Each variable is one or more chunk reads; a model asks
+        # for ~100 of them per time step, and one after another the round
+        # trips add up to minutes per forecast on a remote store (ARCO-ERA5
+        # on Google Cloud from an AWS cluster). The reads are independent.
+        lazy = [(v, self._select(v, time)) for v in variable]
+        workers = max(1, min(fetch_workers(), len(lazy)))
+        if workers == 1:
+            loaded = [self._load(v, sel) for v, sel in lazy]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                loaded = list(pool.map(lambda item: self._load(*item), lazy))   # keeps order
+        arrays = [da.expand_dims(variable=[v]) for (v, _), da in zip(lazy, loaded)]
         out = xr.concat(arrays, dim="variable")
         logger.info("Fetched %s", dict(out.sizes))
         return out.transpose("time", "variable", "lat", "lon")
