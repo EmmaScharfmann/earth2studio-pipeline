@@ -7,6 +7,9 @@ Seasonal evaluation, stage by stage.
 Stages
     status     how many forecasts are done / pending per model
     forecast   run the pending forecasts (GPU), resumable: rerun to continue
+    climatology  build the ERA5 climatology for the region (CPU, one-off,
+               resumable): extreme thresholds and the climatological
+               ensemble baseline. Scoring uses it once it exists.
     score      score every finished forecast against each truth (CPU); only
                new or changed forecasts are scored, so rerun it any time
 
@@ -43,7 +46,9 @@ logger = logging.getLogger("run_season")
 def main() -> int:
     parser = argparse.ArgumentParser(description="Seasonal evaluation of AI ensembles")
     parser.add_argument("config")
-    parser.add_argument("--stage", choices=["status", "forecast", "score"], default="status")
+    parser.add_argument("--stage", choices=["status", "forecast", "climatology", "score"], default="status")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="climatology: years fetched in parallel")
     parser.add_argument("--truths", nargs="+", default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--models", nargs="+", default=None)
@@ -90,10 +95,22 @@ def main() -> int:
                 print(f"    shard {s}: {len(mine):3d} jobs, {expected_minutes(mine):6.0f} min")
         return 0
 
+    if args.stage == "climatology":
+        from weather_pipeline.season.climatology import Climatology
+        import time
+        clim = Climatology(cfg)
+        t0 = time.monotonic()
+        clim.build(workers=args.workers)
+        th = clim.thresholds()
+        print(f"\nclimatology {clim.dir.name}: {len(clim.years)} years, thresholds "
+              f"{dict(th.sizes)} in {(time.monotonic() - t0) / 60:.1f} min -> {clim.dir}")
+        return 0
+
     if args.stage == "score":
         out = run_scoring(cfg, args.models, args.truths, args.force)
         print(f"\n{out['finished_forecasts']} finished forecast(s): scored {out['scored']}, "
-              f"already up to date {out['up_to_date']}, failed {len(out['failed'])}")
+              f"climatology baseline {out['baseline_scored']}, already up to date "
+              f"{out['up_to_date']}, failed {len(out['failed'])}")
         for f in out["failed"]:
             print(f"  FAILED {f}")
         return 1 if out["failed"] else 0

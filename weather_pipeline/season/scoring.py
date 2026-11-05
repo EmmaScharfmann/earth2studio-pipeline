@@ -199,28 +199,80 @@ def _on_grid(field: xr.DataArray, like: xr.DataArray, what: str) -> xr.DataArray
 # scoring
 # ---------------------------------------------------------------------------
 
-def score_case(cfg: SeasonConfig, job: Job, truth: TruthCache,
-               weights: xr.DataArray) -> xr.Dataset:
-    fc = open_forecast(cfg, job)
-    init = pd.Timestamp(job.init_time)
+BASELINE = "climatology"     # the climatological ensemble, scored like a model
+
+
+def _thresholds(clim, valid, fc: xr.DataArray) -> xr.DataArray | None:
+    if clim is None:
+        return None
+    th = clim.thresholds_for(valid).rename(time="lead_time").assign_coords(lead_time=fc["lead_time"].values)
+    return _on_grid(th, fc, "thresholds")
+
+
+def _case(cfg, model, init, fc, truth, weights, clim, written_utc="") -> xr.Dataset:
     valid = [init + pd.Timedelta(lt) for lt in fc["lead_time"].values]
-    obs = truth.fields(valid).rename(time="lead_time").assign_coords(
-        lead_time=fc["lead_time"].values)
+    obs = truth.fields(valid).rename(time="lead_time").assign_coords(lead_time=fc["lead_time"].values)
     obs = _on_grid(obs, fc, truth.truth)
     w = _on_grid(weights, fc, "land weights")
-    seed = zlib.crc32(f"{job.model}|{init.isoformat()}|{truth.truth}".encode())
-    stats = metrics.case_statistics(fc, obs, w, thresholds=None, seed=seed)
+    seed = zlib.crc32(f"{model}|{init.isoformat()}|{truth.truth}".encode())
+    stats = metrics.case_statistics(fc, obs, w, thresholds=_thresholds(clim, valid, fc), seed=seed)
     stats = stats.expand_dims(init_time=[np.datetime64(init, "ns")])
-    stats.attrs.update(model=job.model, truth=truth.truth, init_time=job.init_time,
-                       forecast_written_utc=_manifest_time(job) or "",
-                       n_members=int(fc.sizes["ensemble"]))
+    stats.attrs.update(model=model, truth=truth.truth, init_time=init.isoformat(),
+                       forecast_written_utc=written_utc, n_members=int(fc.sizes["ensemble"]),
+                       has_thresholds=int(clim is not None))
     return stats
+
+
+def score_case(cfg: SeasonConfig, job: Job, truth: TruthCache,
+               weights: xr.DataArray, clim=None) -> xr.Dataset:
+    fc = open_forecast(cfg, job)
+    return _case(cfg, job.model, pd.Timestamp(job.init_time), fc, truth, weights, clim,
+                 _manifest_time(job) or "")
+
+
+def score_baseline(cfg: SeasonConfig, init_time, truth: TruthCache,
+                   weights: xr.DataArray, clim) -> xr.Dataset:
+    """The climatological ensemble for the same init and leads as the models."""
+    from .climatology import member_seed
+    init = pd.Timestamp(init_time)
+    valid = [init + lt for lt in cfg.lead_times]
+    ens = clim.ensemble_for(valid, cfg.n_members_scored, seed=member_seed(init))
+    fc = ens.rename(time="lead_time").assign_coords(lead_time=cfg.lead_times.values)
+    return _case(cfg, BASELINE, init, fc, truth, weights, clim)
+
+
+def _baseline_path(cfg: SeasonConfig, truth: str, init_time) -> Path:
+    return _root(cfg) / "scores" / truth / f"{BASELINE}_{init_slug(str(init_time))}.nc"
+
+
+def _up_to_date(path: Path, written_utc: str | None, has_clim: bool) -> bool:
+    """A stored case is current if it was written by this STATS_VERSION, for
+    this forecast, and with thresholds whenever a climatology exists."""
+    with xr.open_dataset(path) as old:
+        a = old.attrs
+        return (a.get("stats_version", 1) == metrics.STATS_VERSION
+                and (written_utc is None or a.get("forecast_written_utc") == written_utc)
+                and bool(a.get("has_thresholds", 0)) >= has_clim)
+
+
+def _write(stats: xr.Dataset, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".part")
+    stats.to_netcdf(tmp)
+    tmp.rename(path)
 
 
 def run_scoring(cfg: SeasonConfig, models: list[str] | None = None,
                 truths: list[str] | None = None, force: bool = False,
-                truth_sources: dict | None = None, mask_source=None) -> dict:
-    """Score every finished forecast against every truth. Returns counts."""
+                truth_sources: dict | None = None, mask_source=None,
+                climatology=None) -> dict:
+    """Score every finished forecast against every truth. Returns counts.
+
+    With a built climatology (run_season.py --stage climatology), every case
+    also gets the extreme scores, and the climatological ensemble is scored
+    as the BASELINE pseudo-model on the same init times. Without one, cases
+    are scored without thresholds and rescored once it exists.
+    """
     truths = truths or list(cfg.truths)
     unknown = set(truths) - set(cfg.truths)
     if unknown:
@@ -228,31 +280,39 @@ def run_scoring(cfg: SeasonConfig, models: list[str] | None = None,
     weights = land_weights(cfg, mask_source)
     logger.info("land weights: %d of %d cells", int((weights > 0).sum()), weights.size)
 
+    if climatology is None:
+        from .climatology import Climatology
+        candidate = Climatology(cfg)
+        climatology = candidate if candidate.is_built() else None
+    if climatology is None:
+        logger.warning("No climatology built: scoring without extreme thresholds or the "
+                       "climatological baseline (run --stage climatology to add them)")
+    has_clim = climatology is not None
+
     finished = [j for j in build_jobs(cfg, models) if is_done(j, cfg)]
-    summary = {"scored": 0, "up_to_date": 0, "failed": []}
+    inits = sorted({j.init_time for j in finished})
+    summary = {"scored": 0, "up_to_date": 0, "failed": [], "baseline_scored": 0}
     for truth_name in truths:
-        source = (truth_sources or {}).get(truth_name)
-        truth = TruthCache(cfg, truth_name, source)
-        for job in finished:
-            path = stats_path(cfg, truth_name, job)
-            if not force and path.exists():
-                with xr.open_dataset(path) as old:
-                    current = old.attrs.get("stats_version", 1) == metrics.STATS_VERSION
-                    if current and old.attrs.get("forecast_written_utc") == (_manifest_time(job) or ""):
-                        summary["up_to_date"] += 1
-                        continue
-            try:
-                stats = score_case(cfg, job, truth, weights)
-            except Exception as exc:          # one bad case must not stop the season
-                logger.error("FAILED %s vs %s: %s", job.label, truth_name, exc)
-                summary["failed"].append(f"{job.label} vs {truth_name}: {type(exc).__name__}: {exc}")
+        truth = TruthCache(cfg, truth_name, (truth_sources or {}).get(truth_name))
+        work = [(job.label, stats_path(cfg, truth_name, job), _manifest_time(job) or "",
+                 lambda job=job: score_case(cfg, job, truth, weights, climatology)) for job in finished]
+        if has_clim:
+            work += [(f"{BASELINE} @ {init}", _baseline_path(cfg, truth_name, init), None,
+                      lambda init=init: score_baseline(cfg, init, truth, weights, climatology))
+                     for init in inits]
+        for label, path, written, compute in work:
+            if not force and path.exists() and _up_to_date(path, written, has_clim):
+                summary["up_to_date"] += 1
                 continue
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".part")
-            stats.to_netcdf(tmp)
-            tmp.rename(path)
-            summary["scored"] += 1
-            logger.info("scored %s vs %s", job.label, truth_name)
+            try:
+                stats = compute()
+            except Exception as exc:          # one bad case must not stop the season
+                logger.error("FAILED %s vs %s: %s", label, truth_name, exc)
+                summary["failed"].append(f"{label} vs {truth_name}: {type(exc).__name__}: {exc}")
+                continue
+            _write(stats, path)
+            summary["baseline_scored" if label.startswith(BASELINE) else "scored"] += 1
+            logger.info("scored %s vs %s", label, truth_name)
     summary["finished_forecasts"] = len(finished)
     return summary
 
@@ -263,19 +323,22 @@ def run_scoring(cfg: SeasonConfig, models: list[str] | None = None,
 
 def load_statistics(cfg: SeasonConfig, truth: str,
                     models: list[str] | None = None) -> dict[str, xr.Dataset]:
-    """{model: Dataset with an init_time dim} of every scored case. Sum over
-    init_time (or any subset of it), then metrics.finalise."""
+    """{model: Dataset with an init_time dim} of every scored case, plus the
+    BASELINE ("climatology") when it was scored. Sum over init_time (or any
+    subset of it), then metrics.finalise."""
     out = {}
-    for spec in cfg.models:
-        if models and spec.name not in models:
+    names = [spec.name for spec in cfg.models] + [BASELINE]
+    for name in names:
+        if models and name not in models:
             continue
-        files = sorted((_root(cfg) / "scores" / truth).glob(f"{spec.name}_*.nc"))
+        files = sorted((_root(cfg) / "scores" / truth).glob(f"{name}_*.nc"))
         if not files:
             continue
         parts = [xr.open_dataset(f).load() for f in files]
         ds = xr.concat(parts, dim="init_time").sortby("init_time")
-        ds.attrs = {"n_members": parts[0].attrs["n_members"], "model": spec.name, "truth": truth}
-        out[spec.name] = ds
+        ds.attrs = {"n_members": parts[0].attrs["n_members"], "model": name, "truth": truth,
+                    "has_thresholds": int(all(p.attrs.get("has_thresholds", 0) for p in parts))}
+        out[name] = ds
     return out
 
 
