@@ -2,6 +2,7 @@
 like the ones the real backends write."""
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 from weather_pipeline.season import config as C
@@ -38,3 +39,30 @@ def write_store(path, model, n_members, max_lead_h=24, seed=0):
     # Earth2Studio encodes lead_time in hours, which makes xarray warn on read
     enc = {} if anemoi else {"lead_time": {"units": "hours", "dtype": "int64"}}
     ds.to_zarr(path, mode="w", encoding=enc)
+
+
+GLAT = np.linspace(90, -90, 721)
+GLON = np.arange(0, 360, 0.25)
+
+
+class FakeTruth:
+    """A global truth source that counts which times it was asked for."""
+
+    def __init__(self, offset=0.0, lat_shift=0.0):
+        self.requested, self.offset, self.lat_shift = [], offset, lat_shift
+
+    def __call__(self, times, variables):
+        times = list(pd.to_datetime(list(times)))
+        self.requested += times
+        data = 290 + self.offset + np.zeros((len(times), len(variables), GLAT.size, GLON.size))
+        if variables == ["z_surface"]:
+            # height rising southward through the France box: 0..2600 m
+            data = np.broadcast_to((np.arange(GLAT.size) - 140)[:, None].clip(0) * 50.0 * 9.80665,
+                                   data.shape).copy()
+        if variables == ["lsm"]:
+            data = np.zeros_like(data)
+            data[..., : GLAT.size // 2, :] = 1.0          # northern hemisphere = land
+            data[..., 150:160, :] = 0.0                    # a sea strip inside France's box
+        return xr.DataArray(data, dims=("time", "variable", "lat", "lon"),
+                            coords={"time": times, "variable": variables,
+                                    "lat": GLAT + self.lat_shift, "lon": GLON})

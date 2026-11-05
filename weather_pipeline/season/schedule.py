@@ -22,14 +22,22 @@ from .config import SeasonConfig
 
 INIT_FMT = "%Y-%m-%dT%H:%M:%S"     # the form run_benchmark passes to models
 
-# Minutes per job (10 members to +120 h, H100), measured on the first run.
-# Only RELATIVE values matter: they balance the GPUs in shard_jobs. A model
-# missing here counts as DEFAULT_JOB_MINUTES; refine it once measured.
+# Minutes per job of 10 members to +120 h (H100), measured on the first run,
+# scaled linearly with forecast length (job_minutes). Relative values are
+# what balance the GPUs in shard_jobs; the absolute ones feed the estimates
+# that run_season.py prints. A model missing here counts as
+# DEFAULT_JOB_MINUTES; refine it once measured.
 JOB_MINUTES = {
     "aifs-ens1.0": 2.3,
     "aurora1.5-ens-6h": 6.5,
 }
 DEFAULT_JOB_MINUTES = 5.0
+_MEASURED_STEPS = 20            # the 120 h jobs the minutes were measured on
+
+
+def job_minutes(job: "Job") -> float:
+    per_120h = JOB_MINUTES.get(job.model, DEFAULT_JOB_MINUTES)
+    return per_120h * job.n_steps / _MEASURED_STEPS
 
 
 @dataclass(frozen=True)
@@ -95,19 +103,18 @@ def shard_jobs(jobs: list[Job], shard: int, num_shards: int) -> list[Job]:
     """
     if not 0 <= shard < num_shards:
         raise ValueError(f"shard {shard} outside 0..{num_shards - 1}")
-    order = sorted(range(len(jobs)),
-                   key=lambda i: (-JOB_MINUTES.get(jobs[i].model, DEFAULT_JOB_MINUTES), i))
+    order = sorted(range(len(jobs)), key=lambda i: (-job_minutes(jobs[i]), i))
     heap = [(0.0, s) for s in range(num_shards)]
     owner = {}
     for i in order:
         load, s = heapq.heappop(heap)
         owner[i] = s
-        heapq.heappush(heap, (load + JOB_MINUTES.get(jobs[i].model, DEFAULT_JOB_MINUTES), s))
+        heapq.heappush(heap, (load + job_minutes(jobs[i]), s))
     return [job for i, job in enumerate(jobs) if owner[i] == shard]
 
 
 def expected_minutes(jobs: list[Job]) -> float:
-    return sum(JOB_MINUTES.get(j.model, DEFAULT_JOB_MINUTES) for j in jobs)
+    return sum(job_minutes(j) for j in jobs)
 
 
 def is_done(job: Job, cfg: SeasonConfig) -> bool:
