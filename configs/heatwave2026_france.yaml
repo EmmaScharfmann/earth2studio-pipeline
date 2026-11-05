@@ -18,7 +18,9 @@ lead_hours: {every: 6, max: 240}
 region: france
 variable: t2m
 ic_source: arco
-truths: [era5, ifs_fc0]
+# stations: Météo-France hourly, forecast at the nearest land cell;
+# stations_lapse: the same cell, height-corrected (observations.py)
+truths: [era5, ifs_fc0, stations, stations_lapse]
 
 models:
   aifs-ens1.0:      {members: 10}

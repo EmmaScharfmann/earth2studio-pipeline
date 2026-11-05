@@ -42,6 +42,10 @@ TRUTHS: dict[str, tuple[str | None, str | None]] = {
     # step-0 HRES fields from ECMWF open data (Google Cloud / AWS mirrors; the paper's
     # "HRES-fc0"), from 2024
     "ifs_fc0": ("2024-01-01", None),
+    # Météo-France hourly stations (weather_pipeline/season/observations.py):
+    # nearest land cell, and the same cell lapse-corrected to station height
+    "stations": (None, None),
+    "stations_lapse": (None, None),
 }
 
 # Cutoffs of each model's training data (last year seen in any phase), from

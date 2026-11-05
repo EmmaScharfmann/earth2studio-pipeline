@@ -10,6 +10,9 @@ Stages
     climatology  build the ERA5 climatology for the region (CPU, one-off,
                resumable): extreme thresholds and the climatological
                ensemble baseline. Scoring uses it once it exists.
+    stations   fetch, QC and map the station observations for the season's
+               valid times (CPU, network; once per season). Scoring does it
+               too when needed, this shows the QC result first.
     score      score every finished forecast against each truth (CPU); only
                new or changed forecasts are scored, so rerun it any time
 
@@ -46,7 +49,8 @@ logger = logging.getLogger("run_season")
 def main() -> int:
     parser = argparse.ArgumentParser(description="Seasonal evaluation of AI ensembles")
     parser.add_argument("config")
-    parser.add_argument("--stage", choices=["status", "forecast", "climatology", "score"], default="status")
+    parser.add_argument("--stage", choices=["status", "forecast", "climatology", "stations", "score"],
+                        default="status")
     parser.add_argument("--workers", type=int, default=8,
                         help="climatology: years fetched in parallel")
     parser.add_argument("--truths", nargs="+", default=None)
@@ -104,6 +108,19 @@ def main() -> int:
         th = clim.thresholds()
         print(f"\nclimatology {clim.dir.name}: {len(clim.years)} years, thresholds "
               f"{dict(th.sizes)} in {(time.monotonic() - t0) / 60:.1f} min -> {clim.dir}")
+        return 0
+
+    if args.stage == "stations":
+        from weather_pipeline.season.observations import StationTruth
+        st = StationTruth(cfg)
+        start, end = st.window()
+        obs = st.observations()
+        m = st.mapping()
+        report = (st.dir / "qc_report.csv")
+        print(f"\nstations {start} .. {end}: {obs.sizes['station']} kept after QC "
+              f"(report: {report}); {int(m['mapped'].sum())} mapped to a land cell, "
+              f"{int((~m['mapped']).sum())} without one within {st.max_km:.0f} km; "
+              f"{int(m['holdout'].sum())} in the downscaler holdout")
         return 0
 
     if args.stage == "score":

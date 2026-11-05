@@ -201,11 +201,13 @@ def test_bias_is_ensemble_mean_minus_truth():
 def test_maps_by_forecast_day_match_the_cell_scores():
     fc, obs, w, _ = season_case(L=8, with_thresholds=False)   # leads 6..48 h
     st = S.case_statistics(fc, obs, w)
-    assert list(st["lead_day"].values) == [1, 2] and list(st["map_n"].values) == [4, 4]
+    assert list(st["lead_day"].values) == [1, 2]
+    land = w.values > 0
+    n = st["map_n"].values                                    # per cell: leads observed that day
+    assert (n[:, land] == 4).all() and np.isnan(n[:, ~land]).all()
     maps = S.finalise_maps(st)
     ens = fc.values; y = obs.values
     expected = S.crps_fair(ens, y)[:4].mean(axis=0)          # day 1 = first 4 leads
-    land = w.values > 0
     np.testing.assert_allclose(maps["crps"].sel(lead_day=1).values[land], expected[land], rtol=1e-5)
     assert np.isnan(maps["crps"].values[:, ~land]).all()     # sea stays NaN
     np.testing.assert_allclose(maps["bias"].sel(lead_day=1).values[land],
