@@ -48,7 +48,7 @@ SPREAD_EDGES_K = np.array([0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, np.inf])
 
 # Bumped whenever case_statistics gains or changes a variable, so the
 # scoring stage rescores files written by an older version.
-STATS_VERSION = 2
+STATS_VERSION = 3          # 3: per-cell map counts; points and time-varying weights
 
 
 # ---------------------------------------------------------------------------
@@ -177,9 +177,9 @@ def energy_score_fair(ens, y, weights):
 # per-case additive statistics
 # ---------------------------------------------------------------------------
 
-def _wsum(values, w):
-    """Weighted sum over the trailing (lat, lon) axes."""
-    return np.sum(values * w, axis=(-2, -1))
+def _wsum(values, w, n_spatial: int = 2):
+    """Weighted sum over the trailing spatial axes ((lat, lon) or (station,))."""
+    return np.sum(values * w, axis=tuple(range(-n_spatial, 0)))
 
 
 def case_statistics(
@@ -192,33 +192,41 @@ def case_statistics(
 ) -> xr.Dataset:
     """Additive statistics for one forecast case.
 
-    forecast    (member, lead_time, lat, lon), one init time
-    obs         (lead_time, lat, lon), truth at the same valid times
-    weights     (lat, lon): area weight x land mask; zero excludes a cell
-    thresholds  optional (quantile, lead_time, lat, lon): the climatological
+    forecast    (member, lead_time, *space), one init time
+    obs         (lead_time, *space), truth at the same valid times
+    weights     (*space) or (lead_time, *space): area weight x land mask on a
+                grid, or per-station weights; zero excludes a cell at that
+                lead. Time-varying weights let a missing observation drop
+                out of that lead only (stations).
+    thresholds  optional (quantile, lead_time, *space): the climatological
                 threshold valid for each lead's month and hour, so a single
                 `quantile` coordinate covers 0.9 ... 1.0 (record)
+
+    *space is (lat, lon) for gridded truths or (station,) for observations.
 
     Returns a Dataset with dims lead_time [, quantile] [, bin dims] whose
     variables are weighted SUMS over space. Finalise with `finalise`.
     """
     spatial = [d for d in obs.dims if d != "lead_time"]
+    ns = len(spatial)
     forecast = forecast.transpose(member_dim, "lead_time", *spatial)
     obs = obs.transpose("lead_time", *spatial)
-    w2d = weights.transpose(*spatial).values.astype(float)
+    wdims = ["lead_time", *spatial] if "lead_time" in weights.dims else spatial
+    w_in = weights.transpose(*wdims).values.astype(float)
 
-    ens = forecast.values.astype(float)            # (M, L, Y, X)
-    y = obs.values.astype(float)                   # (L, Y, X)
+    ens = forecast.values.astype(float)            # (M, L, *space)
+    y = obs.values.astype(float)                   # (L, *space)
     m = ens.shape[0]
     if m < 2:
         raise ValueError("Ensemble statistics need at least two members")
-    use = w2d > 0
-    if np.isnan(ens[:, :, use]).any() or np.isnan(y[:, use]).any():
+    w = np.broadcast_to(w_in, y.shape)             # (L, *space)
+    use = w > 0
+    if np.isnan(ens[:, use]).any() or np.isnan(y[use]).any():
         raise ValueError("NaN inside the weighted domain; mask it via weights")
     ens = np.where(use, ens, 0.0)                  # keep NaNs out of the sums
     y = np.where(use, y, 0.0)
-    w = np.broadcast_to(w2d, y.shape)
     rng = np.random.default_rng(seed)
+    _ws = lambda values, ww=w: _wsum(values, ww, ns)    # noqa: E731
 
     mu = ens.mean(axis=0)
     var = ens.var(axis=0, ddof=1)
@@ -229,28 +237,34 @@ def case_statistics(
     L = len(lead)
 
     data = {
-        "weight": ("lead_time", _wsum(np.ones_like(y), w)),
-        "err": ("lead_time", _wsum(mu - y, w)),
-        "crps": ("lead_time", _wsum(crps_fair(ens, y), w)),
-        "scrps": ("lead_time", _wsum(np.where(use, scrps(ens, y), 0.0), w)),
-        "dss": ("lead_time", _wsum(np.where(use, dawid_sebastiani(ens, y), 0.0), w)),
-        "se": ("lead_time", _wsum(se, w)),
-        "var": ("lead_time", _wsum(var, w)),
-        "large_se": ("lead_time", _wsum(se * large, w)),
-        "large_n": ("lead_time", _wsum(large.astype(float), w)),
-        # energy score is one number per (case, lead); stored as a sum over
-        # cases with a count so it aggregates like everything else
-        "es": ("lead_time", energy_score_fair(
-            ens[:, :, use], y[:, use], w2d[use])),
-        "es_n": ("lead_time", np.ones(L)),
+        "weight": ("lead_time", _ws(np.ones_like(y))),
+        "err": ("lead_time", _ws(mu - y)),
+        "crps": ("lead_time", _ws(crps_fair(ens, y))),
+        "scrps": ("lead_time", _ws(np.where(use, scrps(ens, y), 0.0))),
+        "dss": ("lead_time", _ws(np.where(use, dawid_sebastiani(ens, y), 0.0))),
+        "se": ("lead_time", _ws(se)),
+        "var": ("lead_time", _ws(var)),
+        "large_se": ("lead_time", _ws(se * large)),
+        "large_n": ("lead_time", _ws(large.astype(float))),
     }
+    # energy score: one number per (case, lead) over the cells/stations used
+    # at that lead; stored as a sum with a count so it aggregates like
+    # everything else (a lead with nothing observed contributes nothing)
+    es, es_n = np.zeros(L), np.zeros(L)
+    for k in range(L):
+        u = use[k]
+        if u.sum() >= 1:
+            es[k] = energy_score_fair(ens[:, k][:, u], y[k][u], w[k][u])
+            es_n[k] = 1.0
+    data["es"] = ("lead_time", es)
+    data["es_n"] = ("lead_time", es_n)
 
     # PIT histogram (randomised), weighted
     pit = randomized_pit(ens, y, rng)
     pit_bin = np.minimum((pit * PIT_BINS).astype(int), PIT_BINS - 1)
     hist = np.zeros((L, PIT_BINS))
     for b in range(PIT_BINS):
-        hist[:, b] = _wsum((pit_bin == b).astype(float), w)
+        hist[:, b] = _ws((pit_bin == b).astype(float))
     data["pit_hist"] = (("lead_time", "pit_bin"), hist)
 
     # spread-skill binned by ensemble standard deviation. Caveat for small
@@ -264,7 +278,7 @@ def case_statistics(
     for name, values in (("bin_weight", np.ones_like(y)), ("bin_var", var), ("bin_se", se)):
         out = np.zeros((L, nb))
         for b in range(nb):
-            out[:, b] = _wsum(values * (sd_bin == b), w)
+            out[:, b] = _ws(values * (sd_bin == b))
         data[name] = (("lead_time", "spread_bin"), out)
 
     coords = {
@@ -287,17 +301,17 @@ def case_statistics(
             # zero, and a finite value keeps 0 * inf = NaN out of the sums
             t = np.where(use, thr_all[q], 0.0)
             o = (y > t).astype(float)
-            tail["brier"][:, q] = _wsum(np.where(use, brier_fair(ens, y, t), 0.0), w)
-            tail["twcrps"][:, q] = _wsum(np.where(use, twcrps_fair(ens, y, t), 0.0), w)
-            tail["obs_events"][:, q] = _wsum(o, w)
-            tail["fc_prob"][:, q] = _wsum(np.mean(ens > t, axis=0), w)
-            tail["miss"][:, q] = _wsum(o * above_all, w)
-            tail["exceed_se"][:, q] = _wsum(se * o, w)
+            tail["brier"][:, q] = _ws(np.where(use, brier_fair(ens, y, t), 0.0))
+            tail["twcrps"][:, q] = _ws(np.where(use, twcrps_fair(ens, y, t), 0.0))
+            tail["obs_events"][:, q] = _ws(o)
+            tail["fc_prob"][:, q] = _ws(np.mean(ens > t, axis=0))
+            tail["miss"][:, q] = _ws(o * above_all)
+            tail["exceed_se"][:, q] = _ws(se * o)
             cpit, defined = randomized_cpit(ens, y, t, rng)
-            tail["cpit_undefined"][:, q] = _wsum(o * ~defined, w)
+            tail["cpit_undefined"][:, q] = _ws(o * ~defined)
             cbin = np.minimum((cpit * CPIT_BINS).astype(int), CPIT_BINS - 1)
             for b in range(CPIT_BINS):
-                cpit_hist[:, q, b] = _wsum(((cbin == b) & defined).astype(float), w)
+                cpit_hist[:, q, b] = _ws(((cbin == b) & defined).astype(float))
         for k, v in tail.items():
             data[k] = (("lead_time", "quantile"), v)
         data["cpit_hist"] = (("lead_time", "quantile", "cpit_bin"), cpit_hist)
@@ -311,12 +325,15 @@ def case_statistics(
     days = np.unique(day)
     crps_cells = crps_fair(ens, y)
     maps = {"map_crps": crps_cells, "map_err": mu - y, "map_se": se, "map_var": var}
+    counts = np.stack([use[day == d].sum(axis=0) for d in days]).astype(float)   # (days, *space)
     for name, values in maps.items():
         out = np.full((len(days),) + y.shape[1:], np.nan, dtype="float32")
         for k, d in enumerate(days):
-            out[k] = np.where(use, values[day == d].sum(axis=0), np.nan)
+            summed = np.where(use[day == d], values[day == d], 0.0).sum(axis=0)
+            out[k] = np.where(counts[k] > 0, summed, np.nan)
         data[name] = (("lead_day", *spatial), out)
-    data["map_n"] = ("lead_day", np.array([(day == d).sum() for d in days], dtype=float))
+    # per cell: how many leads of the day were observed there
+    data["map_n"] = (("lead_day", *spatial), np.where(counts > 0, counts, np.nan))
     coords["lead_day"] = days
     for dim in spatial:
         coords[dim] = obs[dim].values
@@ -392,8 +409,9 @@ def by_band(stats: xr.Dataset, band_of_cell: xr.DataArray, weights: xr.DataArray
     order = band_of_cell.attrs.get("order") or sorted(present)
     for band in [b for b in order if b in present]:   # bands with no weighted cell are skipped
         w = weights.where(band_of_cell == band, 0.0)
-        denom = (w * stats["map_n"]).sum(("lat", "lon"))
-        tot = {k: (w * stats[f"map_{k}"].fillna(0)).sum(("lat", "lon")) for k in ("crps", "err", "se", "var")}
+        space = list(weights.dims)
+        denom = (w * stats["map_n"].fillna(0)).sum(space)
+        tot = {k: (w * stats[f"map_{k}"].fillna(0)).sum(space) for k in ("crps", "err", "se", "var")}
         out[str(band)] = xr.Dataset({
             "crps": tot["crps"] / denom, "bias": tot["err"] / denom,
             "ens_mean_rmse": np.sqrt(tot["se"] / denom),

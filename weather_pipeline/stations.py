@@ -98,6 +98,11 @@ class MeteoFranceHourly:
         "tx1h": ("hourly", "core", "temperature_air_max_2m", 273.15),
         "tn1h": ("hourly", "core", "temperature_air_min_2m", 273.15),
     }
+    # Newer wetterdienst releases renamed some parameters. t2m is the reading
+    # at HH:00 (wetterdienst now says so explicitly: "a reading at one moment,
+    # not a mean"), the right thing to compare with a forecast valid at HH:00.
+    # Tried first; the old names stay as the fallback for older releases.
+    _RENAMED = {"temperature_air_mean_2m": "temperature_air_2m"}
 
     def __init__(self, chunk_size: int = 25, cache_disable: bool = False):
         self.chunk_size = chunk_size
@@ -117,11 +122,23 @@ class MeteoFranceHourly:
         if unknown:
             raise KeyError(f"{unknown} not supported by {self.name}; "
                            f"available: {sorted(self._PARAMS)}")
-        params = [self._PARAMS[v][:3] for v in variables]
         disable = self.cache_disable if cache_disable is None else cache_disable
-        return MeteoFranceObservationRequest(
-            parameters=params, start_date=start.isoformat(), end_date=end.isoformat(),
-            settings=Settings(cache_disable=disable))
+        settings = Settings(cache_disable=disable)
+        old = [self._PARAMS[v][:3] for v in variables]
+        new = [(r, d, self._RENAMED.get(p, p)) for r, d, p in old]
+        # newest naming first: start/end + renamed parameters; then the
+        # releases this module was first written for (0.141: start_date /
+        # end_date + the original names)
+        attempts = [({"start": start.isoformat(), "end": end.isoformat()}, new),
+                    ({"start": start.isoformat(), "end": end.isoformat()}, old),
+                    ({"start_date": start.isoformat(), "end_date": end.isoformat()}, old)]
+        errors = []
+        for dates, params in attempts:
+            try:
+                return MeteoFranceObservationRequest(parameters=params, settings=settings, **dates)
+            except Exception as exc:  # noqa: BLE001  (TypeError or InvalidParameterError)
+                errors.append(f"{type(exc).__name__}: {exc}")
+        raise RuntimeError("wetterdienst rejected every known request form:\n  " + "\n  ".join(errors))
 
     @staticmethod
     def _naive_utc(s: pd.Series) -> pd.Series:
@@ -134,6 +151,8 @@ class MeteoFranceHourly:
         df = req.filter_by_bbox(left=lon0, bottom=min(lat0, lat1),
                                 right=lon1, top=max(lat0, lat1)).df.to_pandas()
         df = df.drop_duplicates("station_id").copy()
+        # newer wetterdienst: start_timestamp / end_timestamp
+        df = df.rename(columns={"start_timestamp": "start_date", "end_timestamp": "end_date"})
         for c in ("start_date", "end_date"):
             df[c] = self._naive_utc(df[c])
         df["station_id"] = df["station_id"].astype(str)
@@ -155,7 +174,12 @@ class MeteoFranceHourly:
     def _fetch_chunk(self, ids, start, end, variables, cache_disable: bool | None = None) -> pd.DataFrame:
         req = self._request(variables, start, end, cache_disable).filter_by_station_id(list(ids))
         try:
-            df = req.values.all().df.to_pandas()
+            # newer wetterdienst: values() is a method; older: a property
+            try:
+                values = req.values()
+            except (AttributeError, TypeError):
+                values = req.values
+            df = values.all().df.to_pandas()
         except TypeError as exc:
             if cache_disable or not self._broken_cache(exc):
                 raise
@@ -164,15 +188,28 @@ class MeteoFranceHourly:
             return self._fetch_chunk(ids, start, end, variables, cache_disable=True)
         if df.empty:
             return pd.DataFrame(columns=["station_id", "variable", "time", "value"])
-        by_native = {self._PARAMS[v][2]: v for v in variables}
-        offset = {v: self._PARAMS[v][3] for v in variables}
+        by_native = {}
+        for v in variables:                       # old and renamed parameter names
+            native = self._PARAMS[v][2]
+            by_native[native] = v
+            by_native[self._RENAMED.get(native, native)] = v
         out = pd.DataFrame({
             "station_id": df["station_id"].astype(str),
             "variable": df["parameter"].astype(str).map(by_native),
             "time": self._naive_utc(df["timestamp"]),
             "value": df["value"].astype("f8"),
         }).dropna(subset=["variable"])
-        out["value"] = out["value"] + out["variable"].map(offset)
+        unmatched = set(df["parameter"].astype(str)) - set(by_native)
+        if unmatched:
+            logger.warning("wetterdienst returned unknown parameter(s) %s; ignored", sorted(unmatched))
+        # Units: releases differ in whether they convert to SI. A 2 m
+        # temperature above 150 is already kelvin; below, it is degC. Decided
+        # per variable from the data, so neither case can silently produce
+        # ~563 K values that the range QC would then discard wholesale.
+        for v in set(out["variable"]):
+            sel = out["variable"] == v
+            if out.loc[sel, "value"].median() < 150:
+                out.loc[sel, "value"] = out.loc[sel, "value"] + self._PARAMS[v][3]
         return out[(out["time"] >= start) & (out["time"] <= end)]
 
     def fetch(self, station_ids, start, end, variables):

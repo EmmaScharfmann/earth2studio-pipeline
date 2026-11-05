@@ -8,10 +8,11 @@ lead down to the shortest, at a few sites and as a land-area average. The
 result shows when each model first saw the event, how its ensemble
 narrowed, and whether the truth fell inside it.
 
-Sites are grid cells (nearest 0.25 deg cell to the given coordinates), not
-stations: a station sees a point, a cell a ~25 km average, so a cell's
-value is expected to sit below a station's record maximum. Station truth
-comes with the station verification.
+Sites are grid cells (nearest 0.25 deg cell to the given coordinates): a
+cell is a ~25 km average, so its value is expected to sit below a station's
+record maximum. When the season has a station truth, the observation of the
+nearest station within SITE_STATION_KM of each site is added as truth
+"stations" (an on-the-hour reading, so a little below the day's maximum).
 """
 
 from __future__ import annotations
@@ -34,6 +35,9 @@ HEATWAVE_SITES = {
     "Paris": (48.82, 2.34),
     "Lyon": (45.73, 5.08),
 }
+
+
+SITE_STATION_KM = 10.0
 
 
 def _nearest(da: xr.DataArray, lat: float, lon: float) -> xr.DataArray:
@@ -94,11 +98,32 @@ def convergence(cfg: SeasonConfig, valid_time, sites: dict | None = None,
                    dim=xr.DataArray(list(by_model), dims="model"), join="outer")
 
     truths = []
-    for name in cfg.truths:
+    for name in [n for n in cfg.truths if n not in ("stations", "stations_lapse")]:
         cache = TruthCache(cfg, name, (truth_sources or {}).get(name))
         truths.append(at_sites(cache.fields([t]).isel(time=0)))
-    truth = xr.concat(truths, dim=xr.DataArray(list(cfg.truths), dims="truth"))
+    names = [n for n in cfg.truths if n not in ("stations", "stations_lapse")]
+    truth = xr.concat(truths, dim=xr.DataArray(names, dims="truth"))
+    if "stations" in cfg.truths:
+        truth = xr.concat([truth, _station_values(cfg, t, sites, truth["site"].values)], dim="truth")
 
     return xr.Dataset({"forecast": fc.transpose("model", "lead_time", "ensemble", "site"),
                        "observed": truth.transpose("truth", "site")},
                       attrs={"valid_time": str(t)})
+
+
+def _station_values(cfg: SeasonConfig, t: pd.Timestamp, sites: dict, site_labels) -> xr.DataArray:
+    """The observation at `t` of the station nearest each site (within
+    SITE_STATION_KM), NaN where none; NaN for the land mean."""
+    from .observations import StationTruth, _haversine_km
+    st = StationTruth(cfg)
+    used = st.used()
+    obs = st.observed([t]).isel(time=0)
+    vals = []
+    for label in site_labels:
+        if label not in sites:
+            vals.append(np.nan); continue
+        lat, lon = sites[label]
+        d = _haversine_km(lat, lon, used["latitude"].values, used["longitude"].values)
+        k = int(np.argmin(d))
+        vals.append(float(obs.sel(station=used.index[k])) if d[k] <= SITE_STATION_KM else np.nan)
+    return xr.DataArray([vals], dims=("truth", "site"), coords={"truth": ["stations"], "site": list(site_labels)})

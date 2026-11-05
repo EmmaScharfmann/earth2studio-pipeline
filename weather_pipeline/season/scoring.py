@@ -241,6 +241,38 @@ def score_baseline(cfg: SeasonConfig, init_time, truth: TruthCache,
     return _case(cfg, BASELINE, init, fc, truth, weights, clim)
 
 
+def _station_case(cfg, model, init, fc, st, truth_name, written_utc="") -> xr.Dataset:
+    """One case against station observations: forecast at the stations' land
+    cells (lapse-corrected for stations_lapse), weight 1 where observed."""
+    from .observations import STATION_TRUTHS
+    valid = [init + pd.Timedelta(lt) for lt in fc["lead_time"].values]
+    fc_st = st.at_stations(fc, lapse=STATION_TRUTHS[truth_name])
+    obs = (st.observed(valid).rename(time="lead_time")
+           .assign_coords(lead_time=fc["lead_time"].values).transpose("lead_time", "station"))
+    w = obs.notnull().astype(float)
+    seed = zlib.crc32(f"{model}|{init.isoformat()}|{truth_name}".encode())
+    stats = metrics.case_statistics(fc_st, obs, w, thresholds=None, seed=seed)
+    stats = stats.expand_dims(init_time=[np.datetime64(init, "ns")])
+    stats.attrs.update(model=model, truth=truth_name, init_time=init.isoformat(),
+                       forecast_written_utc=written_utc, n_members=int(fc.sizes["ensemble"]),
+                       has_thresholds=0, n_stations=int(fc_st.sizes["station"]))
+    return stats
+
+
+def score_station_case(cfg, job, st, truth_name) -> xr.Dataset:
+    return _station_case(cfg, job.model, pd.Timestamp(job.init_time), open_forecast(cfg, job),
+                         st, truth_name, _manifest_time(job) or "")
+
+
+def score_station_baseline(cfg, init_time, st, truth_name, clim) -> xr.Dataset:
+    from .climatology import member_seed
+    init = pd.Timestamp(init_time)
+    valid = [init + lt for lt in cfg.lead_times]
+    ens = clim.ensemble_for(valid, cfg.n_members_scored, seed=member_seed(init))
+    fc = ens.rename(time="lead_time").assign_coords(lead_time=cfg.lead_times.values)
+    return _station_case(cfg, BASELINE, init, fc, st, truth_name)
+
+
 def _baseline_path(cfg: SeasonConfig, truth: str, init_time) -> Path:
     return _root(cfg) / "scores" / truth / f"{BASELINE}_{init_slug(str(init_time))}.nc"
 
@@ -292,16 +324,34 @@ def run_scoring(cfg: SeasonConfig, models: list[str] | None = None,
     finished = [j for j in build_jobs(cfg, models) if is_done(j, cfg)]
     inits = sorted({j.init_time for j in finished})
     summary = {"scored": 0, "up_to_date": 0, "failed": [], "baseline_scored": 0}
+    from .observations import STATION_TRUTHS, StationTruth
+    stations_cache = {}
     for truth_name in truths:
-        truth = TruthCache(cfg, truth_name, (truth_sources or {}).get(truth_name))
-        work = [(job.label, stats_path(cfg, truth_name, job), _manifest_time(job) or "",
-                 lambda job=job: score_case(cfg, job, truth, weights, climatology)) for job in finished]
-        if has_clim:
-            work += [(f"{BASELINE} @ {init}", _baseline_path(cfg, truth_name, init), None,
-                      lambda init=init: score_baseline(cfg, init, truth, weights, climatology))
-                     for init in inits]
+        source = (truth_sources or {}).get(truth_name)
+        if truth_name in STATION_TRUTHS:
+            # one StationTruth (observations + mapping) shared by both station truths
+            st = stations_cache.setdefault("st", StationTruth(cfg, provider=source))
+            work = [(job.label, stats_path(cfg, truth_name, job), _manifest_time(job) or "",
+                     lambda job=job, st=st, t=truth_name: score_station_case(cfg, job, st, t))
+                    for job in finished]
+            if has_clim:
+                work += [(f"{BASELINE} @ {init}", _baseline_path(cfg, truth_name, init), None,
+                          lambda init=init, st=st, t=truth_name: score_station_baseline(cfg, init, st, t, climatology))
+                         for init in inits]
+            # station thresholds (each station's own climatology) are not built yet
+            expect_thresholds = False
+        else:
+            truth = TruthCache(cfg, truth_name, source)
+            work = [(job.label, stats_path(cfg, truth_name, job), _manifest_time(job) or "",
+                     lambda job=job, truth=truth: score_case(cfg, job, truth, weights, climatology))
+                    for job in finished]
+            if has_clim:
+                work += [(f"{BASELINE} @ {init}", _baseline_path(cfg, truth_name, init), None,
+                          lambda init=init, truth=truth: score_baseline(cfg, init, truth, weights, climatology))
+                         for init in inits]
+            expect_thresholds = has_clim
         for label, path, written, compute in work:
-            if not force and path.exists() and _up_to_date(path, written, has_clim):
+            if not force and path.exists() and _up_to_date(path, written, expect_thresholds):
                 summary["up_to_date"] += 1
                 continue
             try:
